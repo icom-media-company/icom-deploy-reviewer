@@ -1,0 +1,541 @@
+# Agent Deploy Authority V2 — REVIEWER DOMAIN workflow.
+#
+# INSTALL THIS FILE AS `.github/workflows/verdict.yml` IN THE SEPARATE, PRIVATE
+# `icom-deploy-reviewer` REPOSITORY — never in icom-business. See ../README.md for the
+# full bootstrap checklist (repo creation, branch protection, environment + secret
+# names, exact token permissions). This file is the SOURCE OF RECORD copied there by
+# the owner; it is not executed from icom-business.
+#
+# ── ARCHITECTURE CHANGE (Agent Deploy Authority V2, owner-mandated): the builder (CC,
+#    running on the owner's Mac) holds ZERO credential for this repo — no read, no
+#    write, no dispatch, no admin. A builder-side dispatch token would only convert
+#    "two keys under one user" into "two tokens under one user", with no real
+#    separation of duties. This workflow therefore no longer WAITS to be dispatched by
+#    the builder; it PULLS its own work, on a schedule:
+#
+#    CC          -> dispatches governed CI 319387091 (builder credential, icom-business
+#                   ONLY) and pushes refs/heads/agent-deploy/request-<deploy_id> to
+#                   icom-business — request.json + evidence.json[.agentleader.sig] only,
+#                   THREE files, never a verdict.
+#    THIS WORKFLOW -> on a cron schedule, lists those pending request branches using its
+#                   OWN read-only cross-repo credential (`read-business` environment,
+#                   below), independently verifies the governed run + the CI-signed
+#                   authorization artifact + the exact SHA, DECIDES
+#                   APPROVE_FOR_PRODUCTION or REJECT_FOR_PRODUCTION itself, and signs
+#                   that verdict with the reviewer's own key — an environment secret of
+#                   THIS repo, never readable by the builder, never by CC.
+#    VPS broker  -> pulls the request branch from icom-business AND separately pulls
+#                   this workflow's signed verdict artifact FROM THIS REPO, using its
+#                   own third, read-only, Actions-scoped credential. See
+#                   agent-deploy-broker.sh's fetch_reviewer_verdict.
+#
+#    A `workflow_dispatch` trigger remains as an OWNER-ONLY manual fallback (the builder
+#    cannot reach it — it has no credential for this repo at all) for out-of-band runs.
+#
+# CRON CAVEATS (known, and how this design tolerates them — GitHub does not guarantee
+# scheduled-workflow timing):
+#   - minimum practical granularity is ~5 minutes, not seconds; this workflow runs every
+#     5 minutes and treats that as the floor, not a promise.
+#   - under platform load, a scheduled run can be delayed or occasionally skipped; a
+#     missed tick is invisible from the outside because the NEXT tick re-lists ALL
+#     still-pending request branches from scratch (idempotent discovery, see job
+#     "discover" below) — nothing here depends on every tick actually firing.
+#   - GitHub disables `schedule` triggers automatically after 60 days with no commit
+#     activity on the repository's default branch. The `workflow_dispatch` fallback lets
+#     the owner manually re-arm/kick a run without needing to push a no-op commit first;
+#     an operator alert for "oldest pending request branch age" (outside this file, see
+#     the runbook) is the intended way to notice this has happened.
+#
+# Contract (see infra/icom-deploy/agent-deploy-v2-spec.md for the broader V2 design this
+# plugs into): this workflow independently verifies the governed run (workflow id
+# 319387091 in icom-media/icom-business, event=workflow_dispatch, conclusion=success,
+# head_branch=main), the exact SHA, and the CI-signed authorization artifact, then
+# DECIDES APPROVE_FOR_PRODUCTION or REJECT_FOR_PRODUCTION itself and signs that verdict
+# with the reviewer's own key. REJECT_FOR_PRODUCTION is a real, reachable outcome: any
+# verification failure (except the one noted below) still produces a signed REJECT
+# artifact, not a bare job failure with no evidence.
+#
+# approved_sha is NEVER an external input, on EITHER trigger path: this workflow derives
+# it itself from the governed run's own artifacts (exactly-one-regex-match, same
+# discipline as agent-deploy-broker.sh's derive_artifact) — one fewer builder-supplied
+# field in the trust chain than the earlier design, and it makes the scheduled and
+# manual trigger paths behave identically.
+#
+# ENVIRONMENT SEPARATION: only `discover` and `verify-and-decide` (both read-only
+# business-data jobs) declare the `read-business` environment; `sign-verdict` is the
+# ONLY job that declares `review`. GitHub environment secrets are scoped to any job that
+# declares that environment, not to a specific job by convention, so putting the signing
+# job on the same environment as either read-only job would put the reviewer signing key
+# in scope for code that talks to icom-business. `read-business` holds only
+# ICOM_BUSINESS_READ_TOKEN; `review` holds only ICOM_DEPLOY_REVIEWER_SIGNING_KEY.
+# `verify-and-decide` has no path at all to the reviewer key — it is not merely
+# unreferenced there.
+#
+# PWN-REQUEST HARDENING (GitHub's documented risk for privileged workflows that
+# inspect untrusted content): this workflow NEVER checks out, builds, or executes
+# candidate code (the approved_sha commit) in ANY job, privileged or not. It never uses
+# actions/checkout at all. Candidate-related data (the manifest JSON, the CI signature,
+# a read-only diff summary) is read via the GitHub REST API only — parsed as data,
+# never executed. The reviewer signing key lives ONLY in the final `sign-verdict` job,
+# which does not hold, and cannot reach, icom-business at all — it consumes only the
+# DATA OUTPUT (an already-decided verdict string + already-fetched trusted script) of
+# the earlier unprivileged job, via a same-repo artifact hand-off.
+#
+# The only genuinely unrecoverable failure (no verdict producible at all) is if
+# `infra/icom-deploy/reviewer-sign-verdict.sh` itself cannot be fetched from
+# icom-business@main — without that trusted signer script there is nothing to run in
+# the privileged job, approve or reject. Every other verification failure decides
+# REJECT_FOR_PRODUCTION and still signs it.
+
+name: Reviewer verdict
+
+on:
+  schedule:
+    # ~5 minute floor — see the CRON CAVEATS note above.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: 'OWNER-ONLY manual fallback. Governed CI run id in icom-media/icom-business (workflow 319387091) to review.'
+        type: string
+        required: true
+      deploy_id:
+        description: 'OWNER-ONLY manual fallback. deploy_id this verdict is for (32 lowercase hex chars) — must equal the CI-signed manifest deploy_id. approved_sha is never an input; this workflow derives it itself.'
+        type: string
+        required: true
+
+# Global minimal default. No job below needs write access to THIS repo's contents,
+# and artifact upload/download authenticate via a separate runner-provisioned token,
+# not this block — so `{}` is correct, not just cautious.
+permissions: {}
+
+jobs:
+  # ── Job 1 — discovers what to review THIS run, and normalises BOTH trigger types
+  #    (schedule and workflow_dispatch) into the SAME {deploy_id, ci_run_id} matrix
+  #    shape, so jobs 2/3 below never special-case the trigger. UNPRIVILEGED: only the
+  #    read-only cross-repo token (to list pending icom-business branches) and this
+  #    repo's own default token (Actions: read, to check for an already-produced
+  #    verdict — idempotent discovery with ZERO write access anywhere). ────────────────
+  discover:
+    name: Discover pending review requests
+    runs-on: ubuntu-latest
+    environment: read-business
+    permissions:
+      actions: read   # THIS repo only — to list its own verdict-* artifacts (idempotency)
+    outputs:
+      matrix: ${{ steps.dispatch.outputs.matrix || steps.poll.outputs.matrix }}
+      has_pending: ${{ steps.dispatch.outputs.has_pending || steps.poll.outputs.has_pending }}
+    env:
+      TARGET_REPO: icom-media/icom-business
+      ICOM_BUSINESS_READ_TOKEN: ${{ secrets.ICOM_BUSINESS_READ_TOKEN }}
+      OWN_REPO: ${{ github.repository }}
+      OWN_TOKEN: ${{ github.token }}
+      MAX_PER_RUN: '5'   # bounded per run [task brief] — the rest wait for the next tick
+    steps:
+      - name: workflow_dispatch path — single-item matrix from validated inputs (approved_sha is NEVER an input)
+        if: github.event_name == 'workflow_dispatch'
+        id: dispatch
+        env:
+          DEPLOY_ID: ${{ inputs.deploy_id }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+        run: |
+          set -euo pipefail
+          echo "$DEPLOY_ID" | grep -Eq '^[0-9a-f]{32}$' || { echo "FAIL: deploy_id must be 32 lowercase hex chars (got '${DEPLOY_ID:-<empty>}')"; exit 1; }
+          echo "$CI_RUN_ID" | grep -Eq '^[0-9]{1,20}$' || { echo "FAIL: ci_run_id must be 1-20 digits (got '${CI_RUN_ID:-<empty>}')"; exit 1; }
+          # requested_at is deliberately left empty on this owner-only manual path — see
+          # the "bounded aging" comment in verify-and-decide's decide step: aging exists
+          # to bound an UNVERIFIABLE request nobody is watching, and a human is already
+          # driving this run.
+          MATRIX="$(jq -c -n --arg id "$DEPLOY_ID" --arg run "$CI_RUN_ID" '{include: [{deploy_id: $id, ci_run_id: $run, requested_at: ""}]}')"
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "has_pending=true" >> "$GITHUB_OUTPUT"
+
+      - name: schedule path — list pending request branches, skip already-verdicted, sort oldest-first, bound MAX_PER_RUN
+        if: github.event_name == 'schedule'
+        id: poll
+        run: |
+          set -uo pipefail   # deliberately no -e: one bad candidate must not abort discovery of the rest
+          [ -n "$ICOM_BUSINESS_READ_TOKEN" ] || { echo "FAIL: ICOM_BUSINESS_READ_TOKEN is not set"; exit 1; }
+          biz_get() { curl -sS --max-time 20 -H "Authorization: Bearer ${ICOM_BUSINESS_READ_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com$1"; }
+          own_get()  { curl -sS --max-time 20 -H "Authorization: Bearer ${OWN_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com$1"; }
+
+          REFS_JSON="$(biz_get "/repos/${TARGET_REPO}/git/matching-refs/heads/agent-deploy/request-")" || REFS_JSON='[]'
+          : > /tmp/candidates.tsv
+          while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+            id="${ref#refs/heads/agent-deploy/request-}"
+            [[ "$id" =~ ^[0-9a-f]{32}$ ]] || continue
+
+            # idempotency: skip if THIS repo already produced a verdict artifact for this
+            # deploy_id — zero write access anywhere is needed to determine this, only a
+            # read of our own repo's own artifact list.
+            ART="$(own_get "/repos/${OWN_REPO}/actions/artifacts?name=verdict-${id}")" || ART='{}'
+            cnt="$(echo "$ART" | jq -r '[.artifacts[]? | select(.expired|not)] | length' 2>/dev/null)" || cnt=""
+            [ "${cnt:-0}" = 0 ] || continue
+
+            REQ_JSON="$(biz_get "/repos/${TARGET_REPO}/contents/request.json?ref=agent-deploy/request-${id}")" || REQ_JSON='{}'
+            enc="$(echo "$REQ_JSON" | jq -r '.encoding // empty' 2>/dev/null)"
+            [ "$enc" = base64 ] || continue
+            REQ_CONTENT="$(echo "$REQ_JSON" | jq -r '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null)"
+            r_id="$(echo "$REQ_CONTENT" | jq -r '.deploy_id // empty' 2>/dev/null)"
+            r_run="$(echo "$REQ_CONTENT" | jq -r '.ci_run_id // empty' 2>/dev/null)"
+            r_ts="$(echo "$REQ_CONTENT" | jq -r '.requested_at // empty' 2>/dev/null)"
+            [ "$r_id" = "$id" ] || continue
+            [[ "$r_run" =~ ^[0-9]{1,20}$ ]] || continue
+            [[ "$r_ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || continue
+            printf '%s\t%s\t%s\n' "$r_ts" "$id" "$r_run" >> /tmp/candidates.tsv
+          done < <(echo "$REFS_JSON" | jq -r '.[]?.ref // empty')
+
+          MATRIX_ITEMS="$(LC_ALL=C sort /tmp/candidates.tsv | head -n "$MAX_PER_RUN" | \
+            jq -R -s -c '[splits("\n")[] | select(length>0) | split("\t") | {deploy_id: .[1], ci_run_id: .[2], requested_at: .[0]}]')"
+          [ -n "$MATRIX_ITEMS" ] || MATRIX_ITEMS='[]'
+          echo "matrix={\"include\":${MATRIX_ITEMS}}" >> "$GITHUB_OUTPUT"
+          if [ "$MATRIX_ITEMS" = "[]" ]; then echo "has_pending=false" >> "$GITHUB_OUTPUT"; else echo "has_pending=true" >> "$GITHUB_OUTPUT"; fi
+
+  # ── Job 2 — UNPRIVILEGED (no reviewer key). Holds only the read-only cross-repo
+  #    token. Verifies the governed run + CI-signed manifest, derives service+
+  #    approved_sha itself (never an external input), decides the verdict, and hands
+  #    ONLY DATA (the decision + the fetched trusted signer script) to job 3 via a
+  #    same-repo artifact. Never checks out or executes candidate code. ────────────────
+  verify-and-decide:
+    name: Verify governed run and decide verdict
+    needs: discover
+    if: needs.discover.outputs.has_pending == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    concurrency:
+      group: verdict-${{ matrix.deploy_id }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    environment: read-business
+    permissions: {}
+    env:
+      DEPLOY_ID: ${{ matrix.deploy_id }}
+      CI_RUN_ID: ${{ matrix.ci_run_id }}
+      REQUESTED_AT: ${{ matrix.requested_at }}
+      TARGET_REPO: icom-media/icom-business
+      TRUSTED_WORKFLOW_ID: "319387091"
+      ICOM_BUSINESS_READ_TOKEN: ${{ secrets.ICOM_BUSINESS_READ_TOKEN }}
+      # [P2-b fix] see the "bounded aging" comment inside the decide step below.
+      MAX_UNVERIFIABLE_AGE_HOURS: "6"
+    steps:
+      # This is the ONE step whose failure aborts the whole run with no verdict at
+      # all — without the trusted signer script, no signed artifact (approve OR
+      # reject) can ever be produced. Fetched from icom-business@main via the
+      # Contents API (data read, never a checkout/execution of candidate code —
+      # `main` is the trusted control-plane branch, not the untrusted approved_sha).
+      - name: Fetch trusted control-plane files from icom-business@main (data only, never executed here)
+        run: |
+          set -euo pipefail
+          [ -n "$ICOM_BUSINESS_READ_TOKEN" ] || { echo "FAIL: ICOM_BUSINESS_READ_TOKEN is not set"; exit 1; }
+          fetch_content() { # <path-in-repo> <outfile>
+            local path="$1" out="$2" json enc
+            json="$(curl -sS --max-time 20 \
+              -H "Authorization: Bearer ${ICOM_BUSINESS_READ_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${TARGET_REPO}/contents/${path}?ref=main")" || { echo "FAIL: request for ${path} did not complete"; exit 1; }
+            enc="$(echo "$json" | jq -r '.encoding // empty' 2>/dev/null)"
+            [ "$enc" = base64 ] || { echo "FAIL: could not fetch ${path} from icom-business@main (encoding='${enc:-<none>}')"; exit 1; }
+            echo "$json" | jq -r '.content' | tr -d '\n' | base64 -d > "$out"
+            [ -s "$out" ] || { echo "FAIL: ${path} fetched empty"; exit 1; }
+          }
+          mkdir -p trusted
+          fetch_content infra/icom-deploy/reviewer-sign-verdict.sh trusted/reviewer-sign-verdict.sh
+          fetch_content infra/icom-deploy/trust/ci-allowed-signers trusted/ci-allowed-signers
+          chmod +x trusted/reviewer-sign-verdict.sh
+          echo "OK: fetched reviewer-sign-verdict.sh + ci-allowed-signers from icom-business@main"
+
+      # Everything below accumulates into one of TWO arrays instead of hard-failing the
+      # job [P2-b fix]: REASONS is for a check that GENUINELY RAN and definitively did
+      # NOT pass (wrong run, ambiguous/malformed artifact contents, invalid signature,
+      # mismatched fields) — that reaches `decide` and produces a signed
+      # REJECT_FOR_PRODUCTION artifact, exactly as before. UNVERIFIABLE is for a check
+      # that could not even be PERFORMED (a transient GitHub read failed — rate limit,
+      # network blip, timeout) — that must NEVER be signed as a genuine reject; it
+      # leaves NO verdict at all, so the broker's WAITING_REVIEW carve-out retries it on
+      # a later scheduled run instead of a good deploy_id being permanently killed by a
+      # GitHub hiccup. See the final decide block below for the AGED_OUT escalation.
+      - name: Verify governed run, artifact, CI signature, and diff evidence
+        id: decide
+        run: |
+          set -uo pipefail   # deliberately no -e: every external call below is checked explicitly
+          API="https://api.github.com"
+          REASONS=()
+          UNVERIFIABLE=()
+          SERVICE=""
+          ARTIFACT_ID=""
+          APPROVED_SHA=""
+          EXPECTED_CURRENT_SHA=""
+
+          gh_get() { # <path> -> body on stdout; 0 only on HTTP 200
+            local path="$1" tmp code
+            tmp="$(mktemp)"
+            code="$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 20 \
+              -H "Authorization: Bearer ${ICOM_BUSINESS_READ_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${API}${path}")" || code=000
+            cat "$tmp"; rm -f "$tmp"
+            [ "$code" = 200 ]
+          }
+          gh_get_binary() { # <path> <outfile> -> 0 on 200 (curl -L follows the artifact-zip redirect)
+            local path="$1" out="$2" code
+            code="$(curl -sS -L -o "$out" -w '%{http_code}' --max-time 120 \
+              -H "Authorization: Bearer ${ICOM_BUSINESS_READ_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${API}${path}")" || code=000
+            [ "$code" = 200 ]
+          }
+
+          # ── (1) trusted CI run — same 5-field check owner-deploy.sh / the VPS
+          #    broker already enforce; reused, not weakened. ──────────────────────
+          RUN_JSON=""
+          HEAD_SHA=""; RUN_ATTEMPT=""
+          if RUN_JSON="$(gh_get "/repos/${TARGET_REPO}/actions/runs/${CI_RUN_ID}")"; then
+            repo_full="$(echo "$RUN_JSON" | jq -r '.repository.full_name // empty')"
+            wf_id="$(echo "$RUN_JSON" | jq -r '.workflow_id // empty')"
+            event="$(echo "$RUN_JSON" | jq -r '.event // empty')"
+            conclusion="$(echo "$RUN_JSON" | jq -r '.conclusion // empty')"
+            head_branch="$(echo "$RUN_JSON" | jq -r '.head_branch // empty')"
+            HEAD_SHA="$(echo "$RUN_JSON" | jq -r '.head_sha // empty')"
+            RUN_ATTEMPT="$(echo "$RUN_JSON" | jq -r '.run_attempt // empty')"
+            if [ "$repo_full" != "$TARGET_REPO" ] || [ "$wf_id" != "$TRUSTED_WORKFLOW_ID" ] \
+              || [ "$event" != workflow_dispatch ] || [ "$conclusion" != success ] || [ "$head_branch" != main ] \
+              || ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
+              REASONS+=("RUN_NOT_TRUSTED")
+            fi
+          else
+            UNVERIFIABLE+=("RUN_NOT_VERIFIABLE")
+          fi
+
+          # ── (2) artifact derivation — exactly one deploy-manifest-(app|api)-<sha>
+          #    match on the WHOLE run. approved_sha is NEVER an external input on
+          #    either trigger path — it comes ONLY from this regex group, exactly
+          #    like agent-deploy-broker.sh's own derive_artifact [§6.1 discipline]. ──
+          if [ "${#REASONS[@]}" -eq 0 ] && [ "${#UNVERIFIABLE[@]}" -eq 0 ]; then
+            ART_JSON=""
+            if ART_JSON="$(gh_get "/repos/${TARGET_REPO}/actions/runs/${CI_RUN_ID}/artifacts")"; then
+              names="$(echo "$ART_JSON" | jq -r '.artifacts[].name')"
+              count=0
+              while IFS= read -r name; do
+                [ -n "$name" ] || continue
+                if [[ "$name" =~ ^deploy-manifest-(app|api)-([0-9a-f]{40})$ ]]; then
+                  count=$((count + 1))
+                  SERVICE="${BASH_REMATCH[1]}"
+                  APPROVED_SHA="${BASH_REMATCH[2]}"
+                  ARTIFACT_ID="$(echo "$ART_JSON" | jq -r --arg n "$name" '.artifacts[] | select(.name==$n) | .id')"
+                fi
+              done <<< "$names"
+              if [ "$count" -ne 1 ] || ! [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]; then
+                REASONS+=("ARTIFACT_AMBIGUOUS")
+              fi
+            else
+              UNVERIFIABLE+=("ARTIFACT_LIST_UNAVAILABLE")
+            fi
+          fi
+
+          # ── (3) download + zip-entry allowlist (zip-slip guard) — data only, never
+          #    executed. Same 3-entry contract as deploy-approved.yml's own upload. ──
+          if [ "${#REASONS[@]}" -eq 0 ] && [ "${#UNVERIFIABLE[@]}" -eq 0 ]; then
+            mkdir -p work
+            if gh_get_binary "/repos/${TARGET_REPO}/actions/artifacts/${ARTIFACT_ID}/zip" work/artifact.zip; then
+              entries="$(unzip -Z1 work/artifact.zip 2>/dev/null | LC_ALL=C sort)"
+              expected="$(printf 'deploy-authorization.json\ndeploy-authorization.json.ci.sig\ndeploy-manifest.json' | LC_ALL=C sort)"
+              if [ "$entries" = "$expected" ]; then
+                unzip -o -q -d work work/artifact.zip deploy-manifest.json deploy-authorization.json deploy-authorization.json.ci.sig \
+                  || UNVERIFIABLE+=("ARTIFACT_EXTRACT_FAILED")
+              else
+                REASONS+=("ARTIFACT_ENTRY_UNEXPECTED")
+              fi
+            else
+              UNVERIFIABLE+=("ARTIFACT_DOWNLOAD_FAILED")
+            fi
+          fi
+
+          # ── (4) CI signature over deploy-authorization.json — verified BEFORE any
+          #    of its fields are believed [§7 of the V2 spec: source of truth]. ─────
+          if [ "${#REASONS[@]}" -eq 0 ] && [ "${#UNVERIFIABLE[@]}" -eq 0 ]; then
+            if ! ssh-keygen -Y verify -f trusted/ci-allowed-signers -I icom-deploy-ci -n icom-deploy-ci \
+              -s work/deploy-authorization.json.ci.sig < work/deploy-authorization.json >/dev/null 2>&1; then
+              REASONS+=("CI_SIGNATURE_INVALID")
+            fi
+          fi
+
+          # ── (5) manifest binding — deploy_id must match the request, and the
+          #    manifest's OWN service/approved_sha must match the artifact-name-
+          #    derived values from (2) [Phase C P1-5 lesson: compare against the
+          #    DERIVED values captured above, never values the manifest itself could
+          #    overwrite before the comparison runs]. ─────────────────────────────
+          if [ "${#REASONS[@]}" -eq 0 ] && [ "${#UNVERIFIABLE[@]}" -eq 0 ]; then
+            m_deploy_id="$(jq -r '.deploy_id // empty' work/deploy-authorization.json)"
+            m_sha="$(jq -r '.approved_sha // empty' work/deploy-authorization.json)"
+            m_service="$(jq -r '.service // empty' work/deploy-manifest.json)"
+            EXPECTED_CURRENT_SHA="$(jq -r '.expected_current_sha // empty' work/deploy-authorization.json)"
+            if [ "$m_deploy_id" != "$DEPLOY_ID" ]; then REASONS+=("DEPLOY_ID_MISMATCH"); fi
+            if [ "$m_sha" != "$APPROVED_SHA" ]; then REASONS+=("APPROVED_SHA_MISMATCH"); fi
+            if [ "$m_service" != "$SERVICE" ]; then REASONS+=("SERVICE_MISMATCH"); fi
+            if ! [[ "$EXPECTED_CURRENT_SHA" =~ ^[0-9a-f]{40}$ ]]; then REASONS+=("EXPECTED_CURRENT_SHA_MALFORMED"); fi
+          fi
+
+          # ── (6) diff evidence — read-only Compare API between the manifest's own
+          #    expected_current_sha and approved_sha. Recorded for the human/agent
+          #    audit trail; never checked out, never executed. ─────────────────────
+          if [ "${#REASONS[@]}" -eq 0 ] && [ "${#UNVERIFIABLE[@]}" -eq 0 ]; then
+            CMP_JSON=""
+            if CMP_JSON="$(gh_get "/repos/${TARGET_REPO}/compare/${EXPECTED_CURRENT_SHA}...${APPROVED_SHA}")"; then
+              {
+                echo "compare ${EXPECTED_CURRENT_SHA}...${APPROVED_SHA}"
+                echo "ahead_by=$(echo "$CMP_JSON" | jq -r '.ahead_by // empty')"
+                echo "files_changed=$(echo "$CMP_JSON" | jq -r '.files | length')"
+                echo "$CMP_JSON" | jq -r '.files[]?.filename' | head -n 200
+              } > work/diff-summary.txt
+            else
+              UNVERIFIABLE+=("DIFF_UNAVAILABLE")
+            fi
+          fi
+
+          # ── [P2-b fix] bounded aging: a request that is STILL only UNVERIFIABLE
+          #    (never a genuine REASONS reject) after MAX_UNVERIFIABLE_AGE_HOURS keeps
+          #    retrying forever otherwise — a persistent (not merely transient) GitHub
+          #    read problem must not leave a deploy_id waiting indefinitely. Escalates
+          #    to a genuine, signed REJECT_FOR_PRODUCTION so the builder gets a terminal
+          #    answer and can cut a fresh governed CI run. requested_at is empty on the
+          #    owner-only workflow_dispatch path (no aging there — a human is already
+          #    driving that run). 6 hours ≈ 72 scheduled ticks at the 5-minute floor:
+          #    long enough to absorb a real GitHub outage, short enough that a stuck
+          #    deploy_id does not wait forever.
+          if [ "${#REASONS[@]}" -eq 0 ] && [ "${#UNVERIFIABLE[@]}" -gt 0 ] \
+            && [[ "${REQUESTED_AT:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+            REQ_EPOCH="$(date -u -d "$REQUESTED_AT" +%s 2>/dev/null || true)"
+            if [[ "$REQ_EPOCH" =~ ^[0-9]+$ ]]; then
+              NOW_EPOCH="$(date -u +%s)"
+              AGE_HOURS=$(( (NOW_EPOCH - REQ_EPOCH) / 3600 ))
+              if [ "$AGE_HOURS" -ge "${MAX_UNVERIFIABLE_AGE_HOURS:-6}" ]; then
+                REASONS+=("AGED_OUT_STILL_UNVERIFIABLE_${UNVERIFIABLE[*]}")
+              fi
+            fi
+          fi
+
+          if [ "${#REASONS[@]}" -eq 0 ] && [ "${#UNVERIFIABLE[@]}" -eq 0 ]; then
+            VERDICT=APPROVE_FOR_PRODUCTION
+            REASON="all checks passed"
+          elif [ "${#REASONS[@]}" -gt 0 ]; then
+            VERDICT=REJECT_FOR_PRODUCTION
+            REASON="${REASONS[*]}"
+          else
+            # [P2-b fix] verified NOTHING that would justify a signed reject — a
+            # transient GitHub read failure, not a genuine problem with the candidate.
+            # NEVER signed: sign-verdict's own step recognises this exact string and
+            # refuses to call the signer at all, leaving no verdict artifact so the
+            # broker's WAITING_REVIEW carve-out retries on a later scheduled run.
+            VERDICT=UNVERIFIABLE
+            REASON="${UNVERIFIABLE[*]}"
+          fi
+          echo "verdict=${VERDICT}" | tee -a "$GITHUB_OUTPUT"
+          echo "reason=${REASON}" | tee -a "$GITHUB_OUTPUT"
+          echo "service=${SERVICE:-unknown}" | tee -a "$GITHUB_OUTPUT"
+          echo "approved_sha=${APPROVED_SHA:-unknown}" | tee -a "$GITHUB_OUTPUT"
+          [ -f work/diff-summary.txt ] || : > work/diff-summary.txt
+          printf '%s' "$VERDICT" > work/verdict.txt
+          printf '%s' "$REASON" > work/reason.txt
+          printf '%s' "${APPROVED_SHA:-}" > work/approved_sha.txt
+
+      - name: Bundle review input for the (unprivileged-to-icom-business) signing job
+        run: |
+          set -euo pipefail
+          mkdir -p bundle
+          cp trusted/reviewer-sign-verdict.sh bundle/reviewer-sign-verdict.sh
+          cp work/verdict.txt bundle/verdict.txt
+          cp work/reason.txt bundle/reason.txt
+          cp work/approved_sha.txt bundle/approved_sha.txt
+          [ -f work/diff-summary.txt ] && cp work/diff-summary.txt bundle/diff-summary.txt || : > bundle/diff-summary.txt
+
+      # Pinned to the release commit for actions/upload-artifact@v7.0.1.
+      - name: Upload review input (same-repo artifact hand-off — no icom-business access in job 3)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: review-input-${{ matrix.deploy_id }}
+          path: bundle
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── Job 3 — PRIVILEGED (holds the reviewer signing key). No icom-business token,
+  #    no network access to the candidate repo at all, no checkout, executes exactly
+  #    one script (reviewer-sign-verdict.sh — fetched and vetted by job 2, not by this
+  #    job) with an already-DECIDED verdict string, never an externally-supplied one.
+  #    Re-runs the SAME matrix as job 2 and reads job 2's decision from the downloaded
+  #    per-item artifact (bundle/verdict.txt), not from a matrix-job output — GitHub
+  #    Actions does not fan matrixed job outputs out to a downstream matrixed job, and
+  #    the artifact hand-off is the same same-repo, no-icom-business-access channel
+  #    job 2 already uses. ─────────────────────────────────────────────────────────
+  sign-verdict:
+    name: Sign reviewer verdict
+    needs: [discover, verify-and-decide]
+    if: needs.discover.outputs.has_pending == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    concurrency:
+      group: verdict-sign-${{ matrix.deploy_id }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    environment: review
+    permissions: {}
+    env:
+      DEPLOY_ID: ${{ matrix.deploy_id }}
+      REVIEWER_ID: icom-deploy-reviewer-ci
+      ICOM_DEPLOY_REVIEWER_SIGNING_KEY: ${{ secrets.ICOM_DEPLOY_REVIEWER_SIGNING_KEY }}
+    steps:
+      # Pinned to the release commit for actions/download-artifact@v8.0.1.
+      - name: Download review input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: review-input-${{ matrix.deploy_id }}
+          path: review-input
+
+      - name: Sign the verdict with the reviewer key (never candidate code — reviewer-sign-verdict.sh is a fixed, job-2-vetted control-plane script)
+        id: sign
+        run: |
+          set -euo pipefail
+          VERDICT="$(cat review-input/verdict.txt)"
+          # [P2-b fix] UNVERIFIABLE means job 2 could not even PERFORM its checks (a
+          # transient GitHub read failure) — never a genuine problem with the
+          # candidate. Sign nothing: leave no verdict artifact at all, so the broker's
+          # WAITING_REVIEW carve-out retries this deploy_id on a later scheduled run
+          # instead of a good deploy_id being permanently killed by a GitHub hiccup.
+          if [ "$VERDICT" = UNVERIFIABLE ]; then
+            echo "no verdict signed: job 2 could not verify this request yet (reason: $(cat review-input/reason.txt 2>/dev/null || echo unknown)) — retried on a later tick"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ -n "$ICOM_DEPLOY_REVIEWER_SIGNING_KEY" ] || { echo "FAIL: ICOM_DEPLOY_REVIEWER_SIGNING_KEY is not set"; exit 1; }
+          APPROVED_SHA="$(cat review-input/approved_sha.txt)"
+          [ "$VERDICT" = APPROVE_FOR_PRODUCTION ] || [ "$VERDICT" = REJECT_FOR_PRODUCTION ] \
+            || { echo "FAIL: upstream verdict '${VERDICT:-<empty>}' is not a recognised verdict — refusing to sign anything"; exit 1; }
+          echo "$APPROVED_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "FAIL: upstream approved_sha '${APPROVED_SHA:-<empty>}' is not a well-formed SHA — refusing to sign anything"; exit 1; }
+          chmod +x review-input/reviewer-sign-verdict.sh
+          umask 077
+          KEY="${RUNNER_TEMP}/icom-deploy-reviewer-signing-key"
+          printf '%s\n' "$ICOM_DEPLOY_REVIEWER_SIGNING_KEY" > "$KEY"
+          chmod 600 "$KEY"
+          mkdir -p out
+          review-input/reviewer-sign-verdict.sh \
+            "$DEPLOY_ID" "$APPROVED_SHA" "$REVIEWER_ID" "$VERDICT" "$KEY" out
+          shred -u "$KEY" 2>/dev/null || rm -f "$KEY"
+          echo "reason (from job 2): $(cat review-input/reason.txt 2>/dev/null || echo unknown)"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      # Pinned to the release commit for actions/upload-artifact@v7.0.1. [P2-b fix]
+      # skipped entirely when nothing was signed — an UNVERIFIABLE tick must publish NO
+      # verdict-<deploy_id> artifact at all, not an empty/error one.
+      - name: Upload signed verdict
+        if: steps.sign.outputs.signed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verdict-${{ matrix.deploy_id }}
+          path: |
+            out/${{ matrix.deploy_id }}.verdict.json
+            out/${{ matrix.deploy_id }}.verdict.json.reviewer.sig
+          retention-days: 30
+          if-no-files-found: error
