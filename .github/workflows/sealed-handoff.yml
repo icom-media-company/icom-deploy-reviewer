@@ -1,0 +1,92 @@
+name: One-time sealed credential handoff
+# TEMPORARY bootstrap workflow — delete after the handoff is verified.
+#
+# Encrypts each environment secret to a VPS-held ephemeral RSA-4096 public key and
+# publishes ONLY ciphertext. Plaintext never leaves the runner: each secret reaches
+# the script through `env:` (never `${{ }}` inside `run:`, never argv), is written
+# with printf (a bash builtin, so it cannot appear in a process listing), encrypted
+# in place, and the plaintext file is shredded before the artifact step runs.
+#
+# The two secrets live in two different environments, so they MUST be handled by two
+# separate jobs — a job can only reach the secrets of the environment it declares.
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  seal-business-read:
+    runs-on: ubuntu-latest
+    environment: read-business
+    permissions: {}
+    env:
+      SECRET_VALUE: ${{ secrets.ICOM_BUSINESS_READ_TOKEN }}
+    steps:
+      - name: Seal to VPS public key
+        run: |
+          set -euo pipefail
+          cat > pub.pem <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAuEjk/q8bfLrYgZDhmj6z
+          xjIvVwGkZRMsIDpIPM0O0kbz2R9y5futWKm7LHn1mcMt12xjYqgtcIe5hQdkhkWJ
+          6TzCs7LkEseTvaa1h4QT3EY+mZVs8FjNJcKwVtwHa66tnLZ1mTw1UafE7GqjwNYA
+          Rj+oTEOD+CZKoncty+vDEzqcdOOPqtgf/LmnmRX8MNfD/FFvp1b1XgE/c7vjkVtn
+          /TueLumyr+3KiJQGp9rge5H3P5QrS+2PfFy5pFzoJSHk+2n+3q7kea2YbwrX+dJa
+          xjD7QApcJaXFsMOXwSXOa+iQ9bn9Nim2bGdOQByZC7kT8wxV9vCPIVMemm0FyIP1
+          o1gI/MesrLWSV2f6cB69WFd5vctqpDQyXOjM3gH+IyEA/XJovuUyqUWWSZCrVx+b
+          ei7lwxTgnawvpq1OgHPmBdhEf+i4QZNoL9nxk2soLGBhIGW+uYU8qq0RH5M1hD3/
+          erz7iJIZswOndtd/qQggy6YhepfLD/EDHM8t0Q7chkyXap6wYI/hqkyb4cfjbQlR
+          cl+476EnqY4xBjwLjfrxyi1PTobdAiAEEAfUR6RyOM2TiAvBa3SncvFXhNBV9lYs
+          HK192k6pXU3m+1lF4bsHGL3xXF2/8Z/OAD7Ebv0Hl1bcaj0E+qRH9oD8mSTgeiTG
+          Hg9RhNS3nUfMSUMzSohduL8CAwEAAQ==
+          -----END PUBLIC KEY-----
+          PEM
+          [ -n "$SECRET_VALUE" ] || { echo "FAIL: ICOM_BUSINESS_READ_TOKEN is empty"; exit 1; }
+          printf '%s' "$SECRET_VALUE" > pt.bin
+          openssl pkeyutl -encrypt -pubin -inkey pub.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -in pt.bin -out ct.bin
+          shred -u pt.bin 2>/dev/null || rm -f pt.bin
+          base64 < ct.bin > pat1.b64
+          echo "sealed ciphertext bytes=$(wc -c < ct.bin)"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sealed-pat1
+          path: pat1.b64
+          retention-days: 1
+          if-no-files-found: error
+
+  seal-reviewer-read:
+    runs-on: ubuntu-latest
+    environment: bootstrap-vps
+    permissions: {}
+    env:
+      SECRET_VALUE: ${{ secrets.ICOM_VPS_REVIEWER_READ_TOKEN }}
+    steps:
+      - name: Seal to VPS public key
+        run: |
+          set -euo pipefail
+          cat > pub.pem <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAuEjk/q8bfLrYgZDhmj6z
+          xjIvVwGkZRMsIDpIPM0O0kbz2R9y5futWKm7LHn1mcMt12xjYqgtcIe5hQdkhkWJ
+          6TzCs7LkEseTvaa1h4QT3EY+mZVs8FjNJcKwVtwHa66tnLZ1mTw1UafE7GqjwNYA
+          Rj+oTEOD+CZKoncty+vDEzqcdOOPqtgf/LmnmRX8MNfD/FFvp1b1XgE/c7vjkVtn
+          /TueLumyr+3KiJQGp9rge5H3P5QrS+2PfFy5pFzoJSHk+2n+3q7kea2YbwrX+dJa
+          xjD7QApcJaXFsMOXwSXOa+iQ9bn9Nim2bGdOQByZC7kT8wxV9vCPIVMemm0FyIP1
+          o1gI/MesrLWSV2f6cB69WFd5vctqpDQyXOjM3gH+IyEA/XJovuUyqUWWSZCrVx+b
+          ei7lwxTgnawvpq1OgHPmBdhEf+i4QZNoL9nxk2soLGBhIGW+uYU8qq0RH5M1hD3/
+          erz7iJIZswOndtd/qQggy6YhepfLD/EDHM8t0Q7chkyXap6wYI/hqkyb4cfjbQlR
+          cl+476EnqY4xBjwLjfrxyi1PTobdAiAEEAfUR6RyOM2TiAvBa3SncvFXhNBV9lYs
+          HK192k6pXU3m+1lF4bsHGL3xXF2/8Z/OAD7Ebv0Hl1bcaj0E+qRH9oD8mSTgeiTG
+          Hg9RhNS3nUfMSUMzSohduL8CAwEAAQ==
+          -----END PUBLIC KEY-----
+          PEM
+          [ -n "$SECRET_VALUE" ] || { echo "FAIL: ICOM_VPS_REVIEWER_READ_TOKEN is empty"; exit 1; }
+          printf '%s' "$SECRET_VALUE" > pt.bin
+          openssl pkeyutl -encrypt -pubin -inkey pub.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -in pt.bin -out ct.bin
+          shred -u pt.bin 2>/dev/null || rm -f pt.bin
+          base64 < ct.bin > pat2.b64
+          echo "sealed ciphertext bytes=$(wc -c < ct.bin)"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sealed-pat2
+          path: pat2.b64
+          retention-days: 1
+          if-no-files-found: error
