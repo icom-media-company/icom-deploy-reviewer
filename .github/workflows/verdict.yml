@@ -187,7 +187,7 @@ jobs:
           done < <(echo "$REFS_JSON" | jq -r '.[]?.ref // empty')
 
           MATRIX_ITEMS="$(LC_ALL=C sort /tmp/candidates.tsv | head -n "$MAX_PER_RUN" | \
-            jq -R -s -c '[splits("\n")[] | select(length>0) | split("\t") | {deploy_id: .[1], ci_run_id: .[2], requested_at: .[0]}]')"
+            jq -R -s -c '[split("\n")[] | select(length>0) | split("\t") | {deploy_id: .[1], ci_run_id: .[2], requested_at: .[0]}]')"
           [ -n "$MATRIX_ITEMS" ] || MATRIX_ITEMS='[]'
           echo "matrix={\"include\":${MATRIX_ITEMS}}" >> "$GITHUB_OUTPUT"
           if [ "$MATRIX_ITEMS" = "[]" ]; then echo "has_pending=false" >> "$GITHUB_OUTPUT"; else echo "has_pending=true" >> "$GITHUB_OUTPUT"; fi
