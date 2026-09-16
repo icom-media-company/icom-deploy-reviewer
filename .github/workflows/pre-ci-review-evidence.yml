@@ -70,9 +70,19 @@ jobs:
                 apps/api/lib/tiktok-creator-marketplace.ts|\
                 apps/api/lib/__tests__/affiliate-creator-discovery-ingest.test.ts|\
                 apps/api/lib/__tests__/tiktok-creator-marketplace-map-phase1.test.ts|\
+                apps/api/app/cron/affiliate-creator-metric-refresh/route.ts|\
+                apps/api/lib/affiliate-creator-metric-refresh.ts|\
+                apps/api/lib/__tests__/affiliate-creator-metric-refresh.test.ts|\
+                scripts/icom-affiliate-creator-sync.sh|\
+                scripts/cron.d/icom-affiliate-creator-sync|\
+                scripts/patch-cron-allowlist-affiliate-creator-sync.sh|\
+                scripts/__tests__/icom-affiliate-creator-sync.test.sh|\
                 supabase/migrations/20260916_41_affiliate_creator_discovery_metadata.sql|\
                 supabase/migrations/20260916_41_affiliate_creator_discovery_metadata_ROLLBACK.sql|\
-                supabase/migrations/20260916_41_affiliate_creator_discovery_metadata_VERIFY.sql) ;;
+                supabase/migrations/20260916_41_affiliate_creator_discovery_metadata_VERIFY.sql|\
+                supabase/migrations/20260916_42_affiliate_creator_sync_runs.sql|\
+                supabase/migrations/20260916_42_affiliate_creator_sync_runs_ROLLBACK.sql|\
+                supabase/migrations/20260916_42_affiliate_creator_sync_runs_VERIFY.sql) ;;
                 *) echo "FAIL: out-of-scope api path: $path"; exit 1 ;;
               esac
             fi
@@ -93,7 +103,7 @@ jobs:
               echo 'FAIL: forbidden Auto Invite SEND/configuration or backorder behavior in API diff'
               exit 1
             fi
-            GENERAL_CHECKS='["exact_sha","forward_only","creator_discovery_phase1_api_scope","migration_41_scope"]'
+            GENERAL_CHECKS='["exact_sha","forward_only","creator_discovery_phase1_api_scope","creator_intelligence_phase2_api_scope","migration_41_scope","migration_42_scope"]'
             CRITICAL_CHECKS='["auto_invite_send_unchanged","auto_invite_configuration_unchanged","backorder_classification_unchanged","unrelated_api_paths_rejected"]'
           fi
           ISSUED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
