@@ -3,12 +3,19 @@ name: Pre-CI review evidence
 on:
   workflow_dispatch:
     inputs:
+      service:
+        description: Component under independent review
+        required: true
+        type: choice
+        options:
+          - app
+          - api
       candidate_sha:
         description: Exact candidate SHA to review
         required: true
         type: string
       expected_current_sha:
-        description: Exact live App SHA used for forward-only review
+        description: Exact live component SHA used for forward-only review
         required: true
         type: string
 
@@ -21,6 +28,7 @@ jobs:
     permissions: {}
     env:
       BUSINESS_TOKEN: ${{ secrets.ICOM_BUSINESS_READ_TOKEN }}
+      SERVICE: ${{ inputs.service }}
       CANDIDATE_SHA: ${{ inputs.candidate_sha }}
       EXPECTED_CURRENT_SHA: ${{ inputs.expected_current_sha }}
       TARGET_REPO: icom-media/icom-business
@@ -31,6 +39,7 @@ jobs:
           SHA_RE='^[0-9a-f]{40}$'
           [[ "$CANDIDATE_SHA" =~ $SHA_RE ]] || { echo 'FAIL: malformed candidate SHA'; exit 1; }
           [[ "$EXPECTED_CURRENT_SHA" =~ $SHA_RE ]] || { echo 'FAIL: malformed expected-current SHA'; exit 1; }
+          case "$SERVICE" in app|api) ;; *) echo 'FAIL: unsupported service'; exit 1 ;; esac
           [ -n "$BUSINESS_TOKEN" ] || { echo 'FAIL: reviewer read credential unavailable'; exit 1; }
           api() {
             curl --fail-with-body -sS --max-time 30 \
@@ -44,34 +53,66 @@ jobs:
           COMPARE="$(api "/repos/$TARGET_REPO/compare/$EXPECTED_CURRENT_SHA...$CANDIDATE_SHA")"
           [ "$(jq -r .status <<<"$COMPARE")" = ahead ] || { echo 'FAIL: candidate is not forward-only from expected current SHA'; exit 1; }
           [ "$(jq -r .base_commit.sha <<<"$COMPARE")" = "$EXPECTED_CURRENT_SHA" ] || { echo 'FAIL: compare base mismatch'; exit 1; }
+          CANDIDATE_TREE_SHA="$(jq -r .commit.tree.sha <<<"$COMMIT")"
+          [[ "$CANDIDATE_TREE_SHA" =~ $SHA_RE ]] || { echo 'FAIL: candidate tree provenance unavailable'; exit 1; }
           jq -r '.files[].filename' <<<"$COMPARE" > out/files.txt
           [ -s out/files.txt ] || { echo 'FAIL: empty candidate diff'; exit 1; }
           while IFS= read -r path; do
-            case "$path" in
-              apps/app/app/affiliate/*|apps/app/lib/affiliate/*) ;;
-              *) echo "FAIL: out-of-scope path: $path"; exit 1 ;;
-            esac
+            if [ "$SERVICE" = app ]; then
+              case "$path" in
+                apps/app/app/affiliate/*|apps/app/lib/affiliate/*) ;;
+                *) echo "FAIL: out-of-scope app path: $path"; exit 1 ;;
+              esac
+            else
+              case "$path" in
+                apps/api/app/cron/affiliate-creator-discovery/route.ts|\
+                apps/api/lib/affiliate-creator-discovery-ingest.ts|\
+                apps/api/lib/tiktok-creator-marketplace.ts|\
+                apps/api/lib/__tests__/affiliate-creator-discovery-ingest.test.ts|\
+                apps/api/lib/__tests__/tiktok-creator-marketplace-map-phase1.test.ts|\
+                supabase/migrations/20260916_41_affiliate_creator_discovery_metadata.sql|\
+                supabase/migrations/20260916_41_affiliate_creator_discovery_metadata_ROLLBACK.sql|\
+                supabase/migrations/20260916_41_affiliate_creator_discovery_metadata_VERIFY.sql) ;;
+                *) echo "FAIL: out-of-scope api path: $path"; exit 1 ;;
+              esac
+            fi
           done < out/files.txt
           ADDED_SOURCE="$(jq -r '.files[] | select(.filename | test("(__tests__|\\.test\\.)") | not) | (.patch // "")' <<<"$COMPARE" | grep '^+' | grep -v '^+++' || true)"
-          if grep -Eiq 'affiliate_shop_settings|AUTO_INVITE_SEND|assignee_profile_id|affiliate-sample-assign|claim_sample|release_sample' <<<"$ADDED_SOURCE"; then
-            echo 'FAIL: critical boundary token changed in Affiliate UI diff'
-            exit 1
+          if [ "$SERVICE" = app ]; then
+            if grep -Eiq 'affiliate_shop_settings|AUTO_INVITE_SEND|assignee_profile_id|affiliate-sample-assign|claim_sample|release_sample' <<<"$ADDED_SOURCE"; then
+              echo 'FAIL: critical boundary token changed in Affiliate UI diff'
+              exit 1
+            fi
+            GENERAL_CHECKS='["exact_sha","forward_only","affiliate_ui_scope"]'
+            CRITICAL_CHECKS='["auto_invite_boundary","flash_sale_boundary","assignment_removal_boundary"]'
+          else
+            # The exact path allowlist above is the primary fail-closed boundary:
+            # Auto Invite SEND/configuration, backorder classification, and every
+            # unrelated API or migration path are rejected before evidence exists.
+            if grep -Eiq 'AUTO_INVITE_SEND[[:space:]]*=|send[_-]?invite|daily_invite_cap|backorder[_-]?classification' <<<"$ADDED_SOURCE"; then
+              echo 'FAIL: forbidden Auto Invite SEND/configuration or backorder behavior in API diff'
+              exit 1
+            fi
+            GENERAL_CHECKS='["exact_sha","forward_only","creator_discovery_phase1_api_scope","migration_41_scope"]'
+            CRITICAL_CHECKS='["auto_invite_send_unchanged","auto_invite_configuration_unchanged","backorder_classification_unchanged","unrelated_api_paths_rejected"]'
           fi
           ISSUED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           POLICY_SHA="${GITHUB_SHA}"
           GENERAL_ID="reviewer-general-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           CRITICAL_ID="reviewer-critical-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          jq -S -n --arg schema icom.pre-ci-review/v1 --arg type general \
+          jq -S -n --arg schema icom.pre-ci-review/v1 --arg type general --arg service "$SERVICE" \
             --arg review_id "$GENERAL_ID" --arg candidate "$CANDIDATE_SHA" \
             --arg base "$EXPECTED_CURRENT_SHA" --arg reviewer icom-deploy-reviewer-ci \
-            --arg policy "$POLICY_SHA" --arg issued "$ISSUED_AT" \
-            '{schema:$schema,review_type:$type,decision:"PASS",review_id:$review_id,candidate_sha:$candidate,expected_current_sha:$base,reviewer_id:$reviewer,policy_sha:$policy,issued_at:$issued,checks:["exact_sha","forward_only","affiliate_ui_scope"]}' \
+            --arg policy "$POLICY_SHA" --arg issued "$ISSUED_AT" --arg repo "$TARGET_REPO" \
+            --arg tree "$CANDIDATE_TREE_SHA" --argjson checks "$GENERAL_CHECKS" \
+            '{schema:$schema,service:$service,review_type:$type,decision:"PASS",review_id:$review_id,source_repository:$repo,candidate_sha:$candidate,candidate_tree_sha:$tree,expected_current_sha:$base,reviewer_id:$reviewer,policy_sha:$policy,issued_at:$issued,checks:$checks}' \
             > out/general.evidence.json
-          jq -S -n --arg schema icom.pre-ci-review/v1 --arg type critical \
+          jq -S -n --arg schema icom.pre-ci-review/v1 --arg type critical --arg service "$SERVICE" \
             --arg review_id "$CRITICAL_ID" --arg candidate "$CANDIDATE_SHA" \
             --arg base "$EXPECTED_CURRENT_SHA" --arg reviewer icom-deploy-reviewer-ci \
-            --arg policy "$POLICY_SHA" --arg issued "$ISSUED_AT" \
-            '{schema:$schema,review_type:$type,decision:"PASS",review_id:$review_id,candidate_sha:$candidate,expected_current_sha:$base,reviewer_id:$reviewer,policy_sha:$policy,issued_at:$issued,checks:["auto_invite_boundary","flash_sale_boundary","assignment_removal_boundary"]}' \
+            --arg policy "$POLICY_SHA" --arg issued "$ISSUED_AT" --arg repo "$TARGET_REPO" \
+            --arg tree "$CANDIDATE_TREE_SHA" --argjson checks "$CRITICAL_CHECKS" \
+            '{schema:$schema,service:$service,review_type:$type,decision:"PASS",review_id:$review_id,source_repository:$repo,candidate_sha:$candidate,candidate_tree_sha:$tree,expected_current_sha:$base,reviewer_id:$reviewer,policy_sha:$policy,issued_at:$issued,checks:$checks}' \
             > out/critical.evidence.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
