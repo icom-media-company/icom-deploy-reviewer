@@ -17,12 +17,26 @@ grep -q 'auto_invite_send_unchanged' "$WF"
 grep -q 'auto_invite_configuration_unchanged' "$WF"
 grep -q 'backorder_classification_unchanged' "$WF"
 grep -q 'unrelated_api_paths_rejected' "$WF"
+grep -q 'canonical_product_fit_scope' "$WF"
+grep -q 'creator_category_provenance' "$WF"
+grep -q 'product_category_chain' "$WF"
+grep -q 'exact_shop_product_creator_binding' "$WF"
+grep -q 'no_scheduler_change' "$WF"
+grep -q 'queue_reservation_unchanged' "$WF"
+grep -q 'invite_route_unchanged' "$WF"
+grep -q 'quota_unchanged' "$WF"
+grep -q 'unrelated_migrations_rejected' "$WF"
 grep -q 'candidate_tree_sha' "$WF"
 grep -q 'source_repository' "$WF"
 grep -q 'apps/api/app/cron/affiliate-creator-discovery/route.ts' "$WF"
 grep -q 'apps/api/app/cron/affiliate-creator-metric-refresh/route.ts' "$WF"
 grep -q 'apps/api/lib/affiliate-creator-metric-refresh.ts' "$WF"
 grep -q 'apps/api/lib/__tests__/affiliate-creator-metric-refresh.test.ts' "$WF"
+grep -q 'apps/api/app/cron/affiliate-creator-pool-refresh/route.ts' "$WF"
+grep -q 'apps/api/lib/affiliate-creator-scoring.ts' "$WF"
+grep -q 'apps/api/lib/tiktok-sync.ts' "$WF"
+grep -q 'apps/api/lib/__tests__/affiliate-creator-pool-refresh.test.ts' "$WF"
+grep -q 'apps/api/lib/__tests__/affiliate-creator-scoring.test.ts' "$WF"
 grep -q 'scripts/icom-affiliate-creator-sync.sh' "$WF"
 grep -q 'scripts/cron.d/icom-affiliate-creator-sync' "$WF"
 grep -q 'scripts/patch-cron-allowlist-affiliate-creator-sync.sh' "$WF"
@@ -70,6 +84,10 @@ grep -q 'affiliate_outreach_quota' "$WF"
 grep -q 'cron\\.schedule' "$WF"
 ! grep -Eq 'apps/api/(app|lib)/\*' "$WF"
 ! grep -Eq 'contents: write|packages: write|deploy-approved|owner-deploy|docker (run|stop|rm)' "$WF"
+grep -q 'affiliate_invite_queue' "$WF"
+grep -q 'affiliate_invite_reservations' "$WF"
+grep -q 'affiliate_outreach_quota' "$WF"
+grep -q 'create_target_collaboration' "$WF"
 
 SENSITIVE_TABLES='(affiliate_invite_queue|affiliate_invite_reservations|affiliate_invites|affiliate_outreach_quota(_snapshot)?)'
 SQL_MUTATION="(insert[[:space:]]+into|upsert[[:space:]]+into|update|delete[[:space:]]+from|merge[[:space:]]+into|truncate([[:space:]]+table)?|copy)[[:space:]]+(public\\.)?${SENSITIVE_TABLES}"
@@ -91,5 +109,44 @@ for fixture in \
   'if (select count(*) from public.affiliate_invites) <> 0 then raise exception'; do
   ! grep -Eiq "$SQL_MUTATION|$CLIENT_MUTATION" <<<"$fixture" \
     || { echo "FAIL: proof-only fixture rejected: $fixture"; exit 1; }
+done
+
+product_fit_path_allowed() {
+  case "$1" in
+    apps/api/app/cron/affiliate-creator-pool-refresh/route.ts|\
+    apps/api/lib/affiliate-creator-discovery-ingest.ts|\
+    apps/api/lib/affiliate-creator-metric-refresh.ts|\
+    apps/api/lib/affiliate-creator-scoring.ts|\
+    apps/api/lib/tiktok-creator-marketplace.ts|\
+    apps/api/lib/tiktok-sync.ts|\
+    apps/api/lib/__tests__/affiliate-creator-discovery-ingest.test.ts|\
+    apps/api/lib/__tests__/affiliate-creator-metric-refresh.test.ts|\
+    apps/api/lib/__tests__/affiliate-creator-pool-refresh.test.ts|\
+    apps/api/lib/__tests__/affiliate-creator-scoring.test.ts|\
+    apps/api/lib/__tests__/tiktok-creator-marketplace-map-phase1.test.ts) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+for fixture in \
+  apps/api/app/cron/affiliate-auto-invite/route.ts \
+  apps/api/app/tiktok/affiliate-invite/route.ts \
+  apps/api/lib/affiliate-invite-queue.ts \
+  apps/api/lib/affiliate-quota-gate.ts \
+  scripts/cron.d/icom-auto-invite \
+  supabase/migrations/20260918_unrelated.sql; do
+  ! product_fit_path_allowed "$fixture" \
+    || { echo "FAIL: forbidden Product Fit path accepted: $fixture"; exit 1; }
+done
+API_FORBIDDEN='AUTO_INVITE_SEND[[:space:]]*=|send[_-]?invite|daily_invite_cap|affiliate_invite_queue|affiliate_invite_reservations|affiliate_outreach_quota|create_target_collaboration|cron\.schedule|backorder[_-]?classification'
+for fixture in \
+  'AUTO_INVITE_SEND = true' \
+  'affiliate_invite_queue.push(item)' \
+  'affiliate_invite_reservations.create(item)' \
+  'affiliate_outreach_quota = quota - 1' \
+  'create_target_collaboration(payload)' \
+  'cron.schedule(worker)' \
+  'backorder_classification = changed'; do
+  grep -Eiq "$API_FORBIDDEN" <<<"$fixture" \
+    || { echo "FAIL: forbidden API behavior escaped scanner: $fixture"; exit 1; }
 done
 echo 'PASS: pre-CI reviewer producer preserves read/sign separation and has no deploy authority.'

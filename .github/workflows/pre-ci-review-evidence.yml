@@ -59,12 +59,16 @@ jobs:
           [ -s out/files.txt ] || { echo 'FAIL: empty candidate diff'; exit 1; }
           AUTO_INVITE_SETTINGS_SCOPE=0
           AUTO_INVITE_SETTINGS_AUDIT_SCOPE=0
+          PRODUCT_FIT_SCOPE=0
           MIGRATION_SHA256=''
           if [ "$SERVICE" = app ] && grep -qx 'supabase/migrations/20260917_43_affiliate_shop_settings_control.sql' out/files.txt; then
             AUTO_INVITE_SETTINGS_SCOPE=1
           fi
           if [ "$SERVICE" = app ] && grep -qx 'supabase/migrations/20260917_44_affiliate_shop_settings_audit.sql' out/files.txt; then
             AUTO_INVITE_SETTINGS_AUDIT_SCOPE=1
+          fi
+          if [ "$SERVICE" = api ] && grep -qx 'apps/api/app/cron/affiliate-creator-pool-refresh/route.ts' out/files.txt; then
+            PRODUCT_FIT_SCOPE=1
           fi
           while IFS= read -r path; do
             if [ "$SERVICE" = app ]; then
@@ -98,27 +102,44 @@ jobs:
                 esac
               fi
             else
-              case "$path" in
-                apps/api/app/cron/affiliate-creator-discovery/route.ts|\
-                apps/api/lib/affiliate-creator-discovery-ingest.ts|\
-                apps/api/lib/tiktok-creator-marketplace.ts|\
-                apps/api/lib/__tests__/affiliate-creator-discovery-ingest.test.ts|\
-                apps/api/lib/__tests__/tiktok-creator-marketplace-map-phase1.test.ts|\
-                apps/api/app/cron/affiliate-creator-metric-refresh/route.ts|\
-                apps/api/lib/affiliate-creator-metric-refresh.ts|\
-                apps/api/lib/__tests__/affiliate-creator-metric-refresh.test.ts|\
-                scripts/icom-affiliate-creator-sync.sh|\
-                scripts/cron.d/icom-affiliate-creator-sync|\
-                scripts/patch-cron-allowlist-affiliate-creator-sync.sh|\
-                scripts/__tests__/icom-affiliate-creator-sync.test.sh|\
-                supabase/migrations/20260916_41_affiliate_creator_discovery_metadata.sql|\
-                supabase/migrations/20260916_41_affiliate_creator_discovery_metadata_ROLLBACK.sql|\
-                supabase/migrations/20260916_41_affiliate_creator_discovery_metadata_VERIFY.sql|\
-                supabase/migrations/20260916_42_affiliate_creator_sync_runs.sql|\
-                supabase/migrations/20260916_42_affiliate_creator_sync_runs_ROLLBACK.sql|\
-                supabase/migrations/20260916_42_affiliate_creator_sync_runs_VERIFY.sql) ;;
-                *) echo "FAIL: out-of-scope api path: $path"; exit 1 ;;
-              esac
+              if [ "$PRODUCT_FIT_SCOPE" = 1 ]; then
+                case "$path" in
+                  apps/api/app/cron/affiliate-creator-pool-refresh/route.ts|\
+                  apps/api/lib/affiliate-creator-discovery-ingest.ts|\
+                  apps/api/lib/affiliate-creator-metric-refresh.ts|\
+                  apps/api/lib/affiliate-creator-scoring.ts|\
+                  apps/api/lib/tiktok-creator-marketplace.ts|\
+                  apps/api/lib/tiktok-sync.ts|\
+                  apps/api/lib/__tests__/affiliate-creator-discovery-ingest.test.ts|\
+                  apps/api/lib/__tests__/affiliate-creator-metric-refresh.test.ts|\
+                  apps/api/lib/__tests__/affiliate-creator-pool-refresh.test.ts|\
+                  apps/api/lib/__tests__/affiliate-creator-scoring.test.ts|\
+                  apps/api/lib/__tests__/tiktok-creator-marketplace-map-phase1.test.ts) ;;
+                  *) echo "FAIL: out-of-scope Product Fit path: $path"; exit 1 ;;
+                esac
+              else
+                case "$path" in
+                  apps/api/app/cron/affiliate-creator-discovery/route.ts|\
+                  apps/api/lib/affiliate-creator-discovery-ingest.ts|\
+                  apps/api/lib/tiktok-creator-marketplace.ts|\
+                  apps/api/lib/__tests__/affiliate-creator-discovery-ingest.test.ts|\
+                  apps/api/lib/__tests__/tiktok-creator-marketplace-map-phase1.test.ts|\
+                  apps/api/app/cron/affiliate-creator-metric-refresh/route.ts|\
+                  apps/api/lib/affiliate-creator-metric-refresh.ts|\
+                  apps/api/lib/__tests__/affiliate-creator-metric-refresh.test.ts|\
+                  scripts/icom-affiliate-creator-sync.sh|\
+                  scripts/cron.d/icom-affiliate-creator-sync|\
+                  scripts/patch-cron-allowlist-affiliate-creator-sync.sh|\
+                  scripts/__tests__/icom-affiliate-creator-sync.test.sh|\
+                  supabase/migrations/20260916_41_affiliate_creator_discovery_metadata.sql|\
+                  supabase/migrations/20260916_41_affiliate_creator_discovery_metadata_ROLLBACK.sql|\
+                  supabase/migrations/20260916_41_affiliate_creator_discovery_metadata_VERIFY.sql|\
+                  supabase/migrations/20260916_42_affiliate_creator_sync_runs.sql|\
+                  supabase/migrations/20260916_42_affiliate_creator_sync_runs_ROLLBACK.sql|\
+                  supabase/migrations/20260916_42_affiliate_creator_sync_runs_VERIFY.sql) ;;
+                  *) echo "FAIL: out-of-scope api path: $path"; exit 1 ;;
+                esac
+              fi
             fi
           done < out/files.txt
           ADDED_SOURCE="$(jq -r '.files[] | select(.filename | test("(__tests__|\\.test\\.)") | not) | (.patch // "")' <<<"$COMPARE" | grep '^+' | grep -v '^+++' || true)"
@@ -177,12 +198,17 @@ jobs:
             # The exact path allowlist above is the primary fail-closed boundary:
             # Auto Invite SEND/configuration, backorder classification, and every
             # unrelated API or migration path are rejected before evidence exists.
-            if grep -Eiq 'AUTO_INVITE_SEND[[:space:]]*=|send[_-]?invite|daily_invite_cap|backorder[_-]?classification' <<<"$ADDED_SOURCE"; then
-              echo 'FAIL: forbidden Auto Invite SEND/configuration or backorder behavior in API diff'
+            if grep -Eiq 'AUTO_INVITE_SEND[[:space:]]*=|send[_-]?invite|daily_invite_cap|affiliate_invite_queue|affiliate_invite_reservations|affiliate_outreach_quota|create_target_collaboration|cron\.schedule|backorder[_-]?classification' <<<"$ADDED_SOURCE"; then
+              echo 'FAIL: forbidden scheduler, SEND, queue/reservation, invite, quota, or backorder behavior in API diff'
               exit 1
             fi
-            GENERAL_CHECKS='["exact_sha","forward_only","creator_discovery_phase1_api_scope","creator_intelligence_phase2_api_scope","migration_41_scope","migration_42_scope"]'
-            CRITICAL_CHECKS='["auto_invite_send_unchanged","auto_invite_configuration_unchanged","backorder_classification_unchanged","unrelated_api_paths_rejected"]'
+            if [ "$PRODUCT_FIT_SCOPE" = 1 ]; then
+              GENERAL_CHECKS='["exact_sha","forward_only","canonical_product_fit_scope","creator_category_provenance","product_category_chain","exact_shop_product_creator_binding"]'
+              CRITICAL_CHECKS='["no_scheduler_change","auto_invite_send_unchanged","queue_reservation_unchanged","invite_route_unchanged","quota_unchanged","unrelated_migrations_rejected","unrelated_api_paths_rejected"]'
+            else
+              GENERAL_CHECKS='["exact_sha","forward_only","creator_discovery_phase1_api_scope","creator_intelligence_phase2_api_scope","migration_41_scope","migration_42_scope"]'
+              CRITICAL_CHECKS='["auto_invite_send_unchanged","auto_invite_configuration_unchanged","backorder_classification_unchanged","unrelated_api_paths_rejected"]'
+            fi
           fi
           ISSUED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           POLICY_SHA="${GITHUB_SHA}"
