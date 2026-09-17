@@ -129,7 +129,11 @@ jobs:
               MIGRATION_SHA256="$(sha256sum out/migration-44.sql | awk '{print $1}')"
               [ "$MIGRATION_SHA256" = cfba02ef9f49d912b6b629352063c913caf94795579e51b7aafbbea6c3d35b2c ] \
                 || { echo 'FAIL: migration 44 checksum mismatch'; exit 1; }
-              if grep -Eiq 'AUTO_INVITE_SEND[[:space:]]*=|affiliate_invite_queue|affiliate_invite_reservations|affiliate_invites|affiliate_outreach_quota|sendapprovedinvites|create_target_collaboration|pg_cron|cron\.schedule|net\.|http_post|http_get' <<<"$ADDED_SOURCE"; then
+              SENSITIVE_TABLES='(affiliate_invite_queue|affiliate_invite_reservations|affiliate_invites|affiliate_outreach_quota(_snapshot)?)'
+              SQL_MUTATION="(insert[[:space:]]+into|upsert[[:space:]]+into|update|delete[[:space:]]+from|merge[[:space:]]+into|truncate([[:space:]]+table)?|copy)[[:space:]]+(public\\.)?${SENSITIVE_TABLES}"
+              CLIENT_MUTATION="(from|table)[(][[:space:]]*['\"]${SENSITIVE_TABLES}['\"][[:space:]]*[)][[:space:]]*\.(insert|upsert|update|delete)[(]"
+              if grep -Eiq 'AUTO_INVITE_SEND[[:space:]]*=|sendapprovedinvites|create_target_collaboration|pg_cron|cron\.schedule|net\.|http_post|http_get' <<<"$ADDED_SOURCE" \
+                 || grep -Eiq "$SQL_MUTATION|$CLIENT_MUTATION" <<<"$ADDED_SOURCE"; then
                 echo 'FAIL: Auto Invite SEND, queue, reservation, invite, quota, TikTok/network, or scheduler behavior changed'
                 exit 1
               fi

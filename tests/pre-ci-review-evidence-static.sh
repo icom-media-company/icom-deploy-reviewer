@@ -59,8 +59,37 @@ grep -q 'affiliate_auto_invite_shop_eligibility_backfilled' "$WF"
 grep -q "'source_enabled_at'" "$WF"
 grep -q 'affiliate_invite_queue' "$WF"
 grep -q 'affiliate_invite_reservations' "$WF"
+grep -Fq 'insert[[:space:]]+into' "$WF"
+grep -Fq 'delete[[:space:]]+from' "$WF"
+grep -Fq 'merge[[:space:]]+into' "$WF"
+grep -Fq 'upsert[[:space:]]+into' "$WF"
+grep -Fq 'truncate([[:space:]]+table)?' "$WF"
+grep -Fq 'affiliate_outreach_quota(_snapshot)?' "$WF"
+grep -Fq '\.(insert|upsert|update|delete)' "$WF"
 grep -q 'affiliate_outreach_quota' "$WF"
 grep -q 'cron\\.schedule' "$WF"
 ! grep -Eq 'apps/api/(app|lib)/\*' "$WF"
 ! grep -Eq 'contents: write|packages: write|deploy-approved|owner-deploy|docker (run|stop|rm)' "$WF"
+
+SENSITIVE_TABLES='(affiliate_invite_queue|affiliate_invite_reservations|affiliate_invites|affiliate_outreach_quota(_snapshot)?)'
+SQL_MUTATION="(insert[[:space:]]+into|upsert[[:space:]]+into|update|delete[[:space:]]+from|merge[[:space:]]+into|truncate([[:space:]]+table)?|copy)[[:space:]]+(public\\.)?${SENSITIVE_TABLES}"
+CLIENT_MUTATION="(from|table)[(][[:space:]]*['\"]${SENSITIVE_TABLES}['\"][[:space:]]*[)][[:space:]]*\.(insert|upsert|update|delete)[(]"
+for fixture in \
+  'insert into public.affiliate_invite_queue values (1)' \
+  'update affiliate_invite_reservations set state = 1' \
+  'delete from affiliate_invites where id = 1' \
+  'upsert into affiliate_outreach_quota values (1)' \
+  'truncate table affiliate_invite_queue' \
+  'client.from("affiliate_invites").insert({})' \
+  'db.table("affiliate_outreach_quota_snapshot").upsert({})'; do
+  grep -Eiq "$SQL_MUTATION|$CLIENT_MUTATION" <<<"$fixture" \
+    || { echo "FAIL: mutation fixture escaped scanner: $fixture"; exit 1; }
+done
+for fixture in \
+  'create table public.affiliate_invite_queue (id bigint primary key)' \
+  'select count(*) from public.affiliate_invite_reservations' \
+  'if (select count(*) from public.affiliate_invites) <> 0 then raise exception'; do
+  ! grep -Eiq "$SQL_MUTATION|$CLIENT_MUTATION" <<<"$fixture" \
+    || { echo "FAIL: proof-only fixture rejected: $fixture"; exit 1; }
+done
 echo 'PASS: pre-CI reviewer producer preserves read/sign separation and has no deploy authority.'
