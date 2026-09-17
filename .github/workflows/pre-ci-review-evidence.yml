@@ -58,13 +58,26 @@ jobs:
           jq -r '.files[].filename' <<<"$COMPARE" > out/files.txt
           [ -s out/files.txt ] || { echo 'FAIL: empty candidate diff'; exit 1; }
           AUTO_INVITE_SETTINGS_SCOPE=0
+          AUTO_INVITE_SETTINGS_AUDIT_SCOPE=0
           MIGRATION_SHA256=''
           if [ "$SERVICE" = app ] && grep -qx 'supabase/migrations/20260917_43_affiliate_shop_settings_control.sql' out/files.txt; then
             AUTO_INVITE_SETTINGS_SCOPE=1
           fi
+          if [ "$SERVICE" = app ] && grep -qx 'supabase/migrations/20260917_44_affiliate_shop_settings_audit.sql' out/files.txt; then
+            AUTO_INVITE_SETTINGS_AUDIT_SCOPE=1
+          fi
           while IFS= read -r path; do
             if [ "$SERVICE" = app ]; then
-              if [ "$AUTO_INVITE_SETTINGS_SCOPE" = 1 ]; then
+              if [ "$AUTO_INVITE_SETTINGS_AUDIT_SCOPE" = 1 ]; then
+                case "$path" in
+                  apps/app/app/affiliate/__tests__/auto-invite-settings-migration.test.ts|\
+                  scripts/verify-auto-invite-settings-audit-db.sh|\
+                  supabase/migrations/20260917_44_affiliate_shop_settings_audit.sql|\
+                  supabase/migrations/20260917_44_affiliate_shop_settings_audit_ROLLBACK.sql|\
+                  supabase/migrations/20260917_44_affiliate_shop_settings_audit_VERIFY.sql) ;;
+                  *) echo "FAIL: out-of-scope Auto Invite settings audit path: $path"; exit 1 ;;
+                esac
+              elif [ "$AUTO_INVITE_SETTINGS_SCOPE" = 1 ]; then
                 case "$path" in
                   apps/app/app/affiliate/'(suite)'/discover/auto-invite-settings/page.tsx|\
                   apps/app/app/affiliate/'(suite)'/discover/page.tsx|\
@@ -110,7 +123,33 @@ jobs:
           done < out/files.txt
           ADDED_SOURCE="$(jq -r '.files[] | select(.filename | test("(__tests__|\\.test\\.)") | not) | (.patch // "")' <<<"$COMPARE" | grep '^+' | grep -v '^+++' || true)"
           if [ "$SERVICE" = app ]; then
-            if [ "$AUTO_INVITE_SETTINGS_SCOPE" = 1 ]; then
+            if [ "$AUTO_INVITE_SETTINGS_AUDIT_SCOPE" = 1 ]; then
+              api "/repos/$TARGET_REPO/contents/supabase/migrations/20260917_44_affiliate_shop_settings_audit.sql?ref=$CANDIDATE_SHA" \
+                | jq -r .content | tr -d '\n' | base64 -d > out/migration-44.sql
+              MIGRATION_SHA256="$(sha256sum out/migration-44.sql | awk '{print $1}')"
+              [ "$MIGRATION_SHA256" = cfba02ef9f49d912b6b629352063c913caf94795579e51b7aafbbea6c3d35b2c ] \
+                || { echo 'FAIL: migration 44 checksum mismatch'; exit 1; }
+              if grep -Eiq 'AUTO_INVITE_SEND[[:space:]]*=|affiliate_invite_queue|affiliate_invite_reservations|affiliate_invites|affiliate_outreach_quota|sendapprovedinvites|create_target_collaboration|pg_cron|cron\.schedule|net\.|http_post|http_get' <<<"$ADDED_SOURCE"; then
+                echo 'FAIL: Auto Invite SEND, queue, reservation, invite, quota, TikTok/network, or scheduler behavior changed'
+                exit 1
+              fi
+              grep -q 'insert into public.audit_log' out/migration-44.sql \
+                || { echo 'FAIL: migration 44 does not write durable audit'; exit 1; }
+              grep -q 'update public.affiliate_shop_settings' out/migration-44.sql \
+                || { echo 'FAIL: migration 44 does not own the settings transition'; exit 1; }
+              grep -q 'affiliate_auto_invite_shop_eligibility_backfilled' out/migration-44.sql \
+                || { echo 'FAIL: migration 44 truthful backfill contract missing'; exit 1; }
+              grep -q "'backfilled', true" out/migration-44.sql \
+                || { echo 'FAIL: migration 44 backfill is not explicitly marked'; exit 1; }
+              grep -q "'source_enabled_at'" out/migration-44.sql \
+                || { echo 'FAIL: migration 44 backfill source timestamp missing'; exit 1; }
+              if grep -Eiq 'exception[[:space:]]+when' out/migration-44.sql; then
+                echo 'FAIL: migration 44 may swallow audit failure'
+                exit 1
+              fi
+              GENERAL_CHECKS='["exact_sha","forward_only","auto_invite_shop_settings_audit_scope","migration_44_scope","migration_44_checksum","truthful_backfill"]'
+              CRITICAL_CHECKS='["atomic_settings_audit","audit_failure_rolls_back","founder_coder_boundary","product_shop_isolation","send_off_boundary","queue_reservation_invite_absent","quota_consumption_absent","scheduler_activation_absent","unrelated_paths_rejected"]'
+            elif [ "$AUTO_INVITE_SETTINGS_SCOPE" = 1 ]; then
               api "/repos/$TARGET_REPO/contents/supabase/migrations/20260917_43_affiliate_shop_settings_control.sql?ref=$CANDIDATE_SHA" \
                 | jq -r .content | tr -d '\n' | base64 -d > out/migration-43.sql
               MIGRATION_SHA256="$(sha256sum out/migration-43.sql | awk '{print $1}')"
