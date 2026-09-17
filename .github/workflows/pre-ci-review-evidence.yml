@@ -57,12 +57,33 @@ jobs:
           [[ "$CANDIDATE_TREE_SHA" =~ $SHA_RE ]] || { echo 'FAIL: candidate tree provenance unavailable'; exit 1; }
           jq -r '.files[].filename' <<<"$COMPARE" > out/files.txt
           [ -s out/files.txt ] || { echo 'FAIL: empty candidate diff'; exit 1; }
+          AUTO_INVITE_SETTINGS_SCOPE=0
+          MIGRATION_SHA256=''
+          if [ "$SERVICE" = app ] && grep -qx 'supabase/migrations/20260917_43_affiliate_shop_settings_control.sql' out/files.txt; then
+            AUTO_INVITE_SETTINGS_SCOPE=1
+          fi
           while IFS= read -r path; do
             if [ "$SERVICE" = app ]; then
-              case "$path" in
-                apps/app/app/affiliate/*|apps/app/lib/affiliate/*) ;;
-                *) echo "FAIL: out-of-scope app path: $path"; exit 1 ;;
-              esac
+              if [ "$AUTO_INVITE_SETTINGS_SCOPE" = 1 ]; then
+                case "$path" in
+                  apps/app/app/affiliate/'(suite)'/discover/auto-invite-settings/page.tsx|\
+                  apps/app/app/affiliate/'(suite)'/discover/page.tsx|\
+                  apps/app/app/affiliate/AutoInviteSettings.tsx|\
+                  apps/app/app/affiliate/auto-invite-settings-actions.ts|\
+                  apps/app/app/affiliate/__tests__/auto-invite-settings-actions.test.ts|\
+                  apps/app/app/affiliate/__tests__/auto-invite-settings-migration.test.ts|\
+                  apps/app/app/affiliate/__tests__/auto-invite-settings-ui.test.tsx|\
+                  supabase/migrations/20260917_43_affiliate_shop_settings_control.sql|\
+                  supabase/migrations/20260917_43_affiliate_shop_settings_control_ROLLBACK.sql|\
+                  supabase/migrations/20260917_43_affiliate_shop_settings_control_VERIFY.sql) ;;
+                  *) echo "FAIL: out-of-scope Auto Invite settings path: $path"; exit 1 ;;
+                esac
+              else
+                case "$path" in
+                  apps/app/app/affiliate/*|apps/app/lib/affiliate/*) ;;
+                  *) echo "FAIL: out-of-scope app path: $path"; exit 1 ;;
+                esac
+              fi
             else
               case "$path" in
                 apps/api/app/cron/affiliate-creator-discovery/route.ts|\
@@ -89,12 +110,26 @@ jobs:
           done < out/files.txt
           ADDED_SOURCE="$(jq -r '.files[] | select(.filename | test("(__tests__|\\.test\\.)") | not) | (.patch // "")' <<<"$COMPARE" | grep '^+' | grep -v '^+++' || true)"
           if [ "$SERVICE" = app ]; then
-            if grep -Eiq 'affiliate_shop_settings|AUTO_INVITE_SEND|assignee_profile_id|affiliate-sample-assign|claim_sample|release_sample' <<<"$ADDED_SOURCE"; then
-              echo 'FAIL: critical boundary token changed in Affiliate UI diff'
-              exit 1
+            if [ "$AUTO_INVITE_SETTINGS_SCOPE" = 1 ]; then
+              api "/repos/$TARGET_REPO/contents/supabase/migrations/20260917_43_affiliate_shop_settings_control.sql?ref=$CANDIDATE_SHA" \
+                | jq -r .content | tr -d '\n' | base64 -d > out/migration-43.sql
+              MIGRATION_SHA256="$(sha256sum out/migration-43.sql | awk '{print $1}')"
+              [ "$MIGRATION_SHA256" = f391fa4b474075ec2dab61ed3d05ebdd51e9d134643c865cbded090c1bfe735b ] \
+                || { echo 'FAIL: migration 43 checksum mismatch'; exit 1; }
+              if grep -Eiq 'AUTO_INVITE_SEND[[:space:]]*=|affiliate_invite_queue|affiliate_outreach_quota|sendapprovedinvites|create_target_collaboration|pg_cron|cron\.schedule|net\.|http_post|http_get' <<<"$ADDED_SOURCE"; then
+                echo 'FAIL: Auto Invite SEND, queue, quota, TikTok/network, or scheduler behavior changed'
+                exit 1
+              fi
+              GENERAL_CHECKS='["exact_sha","forward_only","auto_invite_shop_settings_ui_scope","migration_43_scope","migration_43_checksum"]'
+              CRITICAL_CHECKS='["send_off_boundary","invite_creation_absent","queue_execution_absent","quota_consumption_absent","scheduler_activation_absent","unrelated_paths_rejected"]'
+            else
+              if grep -Eiq 'affiliate_shop_settings|AUTO_INVITE_SEND|assignee_profile_id|affiliate-sample-assign|claim_sample|release_sample' <<<"$ADDED_SOURCE"; then
+                echo 'FAIL: critical boundary token changed in Affiliate UI diff'
+                exit 1
+              fi
+              GENERAL_CHECKS='["exact_sha","forward_only","affiliate_ui_scope"]'
+              CRITICAL_CHECKS='["auto_invite_boundary","flash_sale_boundary","assignment_removal_boundary"]'
             fi
-            GENERAL_CHECKS='["exact_sha","forward_only","affiliate_ui_scope"]'
-            CRITICAL_CHECKS='["auto_invite_boundary","flash_sale_boundary","assignment_removal_boundary"]'
           else
             # The exact path allowlist above is the primary fail-closed boundary:
             # Auto Invite SEND/configuration, backorder classification, and every
@@ -114,15 +149,15 @@ jobs:
             --arg review_id "$GENERAL_ID" --arg candidate "$CANDIDATE_SHA" \
             --arg base "$EXPECTED_CURRENT_SHA" --arg reviewer icom-deploy-reviewer-ci \
             --arg policy "$POLICY_SHA" --arg issued "$ISSUED_AT" --arg repo "$TARGET_REPO" \
-            --arg tree "$CANDIDATE_TREE_SHA" --argjson checks "$GENERAL_CHECKS" \
-            '{schema:$schema,service:$service,review_type:$type,decision:"PASS",review_id:$review_id,source_repository:$repo,candidate_sha:$candidate,candidate_tree_sha:$tree,expected_current_sha:$base,reviewer_id:$reviewer,policy_sha:$policy,issued_at:$issued,checks:$checks}' \
+            --arg tree "$CANDIDATE_TREE_SHA" --arg migration_sha256 "$MIGRATION_SHA256" --argjson checks "$GENERAL_CHECKS" \
+            '{schema:$schema,service:$service,review_type:$type,decision:"PASS",review_id:$review_id,source_repository:$repo,candidate_sha:$candidate,candidate_tree_sha:$tree,expected_current_sha:$base,reviewer_id:$reviewer,policy_sha:$policy,issued_at:$issued,checks:$checks} + (if $migration_sha256 == "" then {} else {migration_sha256:$migration_sha256} end)' \
             > out/general.evidence.json
           jq -S -n --arg schema icom.pre-ci-review/v1 --arg type critical --arg service "$SERVICE" \
             --arg review_id "$CRITICAL_ID" --arg candidate "$CANDIDATE_SHA" \
             --arg base "$EXPECTED_CURRENT_SHA" --arg reviewer icom-deploy-reviewer-ci \
             --arg policy "$POLICY_SHA" --arg issued "$ISSUED_AT" --arg repo "$TARGET_REPO" \
-            --arg tree "$CANDIDATE_TREE_SHA" --argjson checks "$CRITICAL_CHECKS" \
-            '{schema:$schema,service:$service,review_type:$type,decision:"PASS",review_id:$review_id,source_repository:$repo,candidate_sha:$candidate,candidate_tree_sha:$tree,expected_current_sha:$base,reviewer_id:$reviewer,policy_sha:$policy,issued_at:$issued,checks:$checks}' \
+            --arg tree "$CANDIDATE_TREE_SHA" --arg migration_sha256 "$MIGRATION_SHA256" --argjson checks "$CRITICAL_CHECKS" \
+            '{schema:$schema,service:$service,review_type:$type,decision:"PASS",review_id:$review_id,source_repository:$repo,candidate_sha:$candidate,candidate_tree_sha:$tree,expected_current_sha:$base,reviewer_id:$reviewer,policy_sha:$policy,issued_at:$issued,checks:$checks} + (if $migration_sha256 == "" then {} else {migration_sha256:$migration_sha256} end)' \
             > out/critical.evidence.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
