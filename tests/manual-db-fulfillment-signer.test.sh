@@ -40,6 +40,34 @@ with tarfile.open(r/'special.tar.gz','w:gz') as t:
   x=tarfile.TarInfo(name); x.type=kind; x.linkname='target'; t.addfile(x)
 PY
 ! "$ARCHIVE" tar "$tmp/bad.tar.gz" >/dev/null 2>&1 && ! "$ARCHIVE" zip "$tmp/dup.zip" >/dev/null 2>&1 && ! "$ARCHIVE" tar "$tmp/special.tar.gz" >/dev/null 2>&1 && ok Q_archive_mutations_rejected || bad Q_archive_mutations_rejected
+if python3 - "$ROOT" "$tmp" <<'PY'
+import importlib.util,pathlib,sys,zipfile
+root=pathlib.Path(sys.argv[1]); tmp=pathlib.Path(sys.argv[2])
+spec=importlib.util.spec_from_file_location("canonical_actions_logs",root/"trusted/canonical_actions_logs.py")
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+files={"0_mint.txt":b"mint log\n","1_validate-data.txt":b"validate log\n","mint/system.txt":b"mint system\n","validate-data/system.txt":b"validate system\n"}
+def make(name,items,compression,date):
+ with zipfile.ZipFile(tmp/name,"w",compression=compression) as archive:
+  for entry,content in items:
+   info=zipfile.ZipInfo(entry,date); info.compress_type=compression; info.external_attr=0o100644 << 16
+   archive.writestr(info,content)
+names=sorted(files)
+make("logs-a.zip",files.items(),zipfile.ZIP_STORED,(2020,1,1,0,0,0))
+make("logs-b.zip",reversed(list(files.items())),zipfile.ZIP_DEFLATED,(2026,10,1,12,0,0))
+expected=module.canonical_digest(tmp/"logs-a.zip",names)
+assert module.canonical_digest(tmp/"logs-b.zip",names)==expected
+mutations={
+ "content.zip": {**files,"0_mint.txt":b"changed\n"}.items(),
+ "name.zip": [("renamed.txt" if key=="0_mint.txt" else key,value) for key,value in files.items()],
+ "extra.zip": [*files.items(),("extra.txt",b"extra\n")],
+}
+for name,items in mutations.items():
+ make(name,items,zipfile.ZIP_DEFLATED,(2026,10,1,12,0,0))
+ try: digest=module.canonical_digest(tmp/name,names)
+ except ValueError: continue
+ assert digest!=expected
+PY
+then ok Q2_log_zip_canonical_content_binding; else bad Q2_log_zip_canonical_content_binding; fi
 cat > "$tmp/artifacts.json" <<JSON
 {"artifacts":[{"id":7,"name":"manual-db-stage-d0819f7bacf5ee6dedca4345796a8d022ff6a5cc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expired":false,"workflow_run":{"id":9,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}
 JSON
@@ -65,7 +93,7 @@ ssh-keygen -q -t ed25519 -N '' -C '' -f "$tmp/repro-key"
 pub="$(ssh-keygen -y -f "$tmp/repro-key" | awk '{print $1" "$2}')"
 printf 'icom-deploy-ci %s\n' "$pub" > "$tmp/repro-control/ci-allowed-signers"
 cat > "$tmp/legacy-run-evidence.json" <<'JSON'
-{"attempt1_failed_step":"Re-authorize signer and resolve durable state","attempt1_job_id":110237504710,"attempt1_run_id":36821369400,"attempt1_signing_step":"skipped","attempt1_staging_step":"skipped","attempt2_conclusion":"cancelled","earlier_trusted_runs":[{"effective_mode":"validation_only","jobs_sha256":"87a962c3d3642ac7fd252f385ece3fad01862a6bee7df2ae023a3e77d9f71243","mint_job":"skipped","run_id":36816248037,"run_sha256":"6b491e96ac2d129a9ad48d90df36bc33f995e0bf9cbc6a106e9d8d9e062101e5"},{"effective_mode":"validation_only","jobs_sha256":"33d193426feadaaf2092e2ca9561a081c542acf2b17f9f85d6ca227996920277","mint_job":"skipped","run_id":36821338542,"run_sha256":"84ad3bc2291031006d3c41376e51b8a8b501adade2da8effd3085728f627e6c9"}],"legacy_control_workflow_run_census":[{"listed_run_attempt":1,"run_id":36816248037,"verified_attempts":[1]},{"listed_run_attempt":1,"run_id":36821338542,"verified_attempts":[1]},{"listed_run_attempt":2,"run_id":36821369400,"verified_attempts":[1,2]}],"legacy_control_workflow_run_census_sha256":"4b88c868c5bbb6795c313918ae4bacbb2b6a79e4c01952bfd1de9a8933e38efd","legacy_release_assets_empty_at_supersession":true,"legacy_release_author":"github-actions[bot]","legacy_release_html_url":"https://github.com/icom-media-company/icom-deploy-reviewer/releases/tag/untagged-f9eb7bff73f2e9e57c0b","legacy_release_id":400681564,"legacy_release_tag":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/b589d4d92200ac393a04344f2f203efe7f177e6a","legacy_release_updated_at":"2026-10-01T05:47:07Z","legacy_tag_target":"b589d4d92200ac393a04344f2f203efe7f177e6a","post_create_lookup_http_status":404,"raw_sha256":{"attempt1_jobs":"6ee7d03e4c4948474ba8f6727937c1e1f0aacc80a543b2ebe5dcec26dd12d5f2","attempt1_logs_zip":"51c304d815452b48aad45337dcfcd9a60f4542f1100363f181e694370bb54c74","attempt1_run":"d5e1d7d2692f23c064e994e8b4d771e09118710366c907025943eb04474a496c","attempt2_run":"2d5a5561f00211af0b73be530d51bb75e6daf9d2868f431b857366dba22a1ca3"},"repository":"icom-media-company/icom-deploy-reviewer","schema_version":1,"workflow_id":371811486,"workflow_path":".github/workflows/manual-db-fulfillment-signer.yml"}
+{"attempt1_failed_step":"Re-authorize signer and resolve durable state","attempt1_job_id":110237504710,"attempt1_run_id":36821369400,"attempt1_signing_step":"skipped","attempt1_staging_step":"skipped","attempt2_conclusion":"cancelled","canonical_content_sha256":{"attempt1_logs":"395b7a31117dac39014614c43a92c6ab99f4553cfbd2b361297b2acce10d247a"},"earlier_trusted_runs":[{"effective_mode":"validation_only","jobs_sha256":"87a962c3d3642ac7fd252f385ece3fad01862a6bee7df2ae023a3e77d9f71243","mint_job":"skipped","run_id":36816248037,"run_sha256":"6b491e96ac2d129a9ad48d90df36bc33f995e0bf9cbc6a106e9d8d9e062101e5"},{"effective_mode":"validation_only","jobs_sha256":"33d193426feadaaf2092e2ca9561a081c542acf2b17f9f85d6ca227996920277","mint_job":"skipped","run_id":36821338542,"run_sha256":"84ad3bc2291031006d3c41376e51b8a8b501adade2da8effd3085728f627e6c9"}],"legacy_control_workflow_run_census":[{"listed_run_attempt":1,"run_id":36816248037,"verified_attempts":[1]},{"listed_run_attempt":1,"run_id":36821338542,"verified_attempts":[1]},{"listed_run_attempt":2,"run_id":36821369400,"verified_attempts":[1,2]}],"legacy_control_workflow_run_census_sha256":"4b88c868c5bbb6795c313918ae4bacbb2b6a79e4c01952bfd1de9a8933e38efd","legacy_release_assets_empty_at_supersession":true,"legacy_release_author":"github-actions[bot]","legacy_release_html_url":"https://github.com/icom-media-company/icom-deploy-reviewer/releases/tag/untagged-f9eb7bff73f2e9e57c0b","legacy_release_id":400681564,"legacy_release_tag":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/b589d4d92200ac393a04344f2f203efe7f177e6a","legacy_release_updated_at":"2026-10-01T05:47:07Z","legacy_tag_target":"b589d4d92200ac393a04344f2f203efe7f177e6a","post_create_lookup_http_status":404,"raw_sha256":{"attempt1_jobs":"6ee7d03e4c4948474ba8f6727937c1e1f0aacc80a543b2ebe5dcec26dd12d5f2","attempt1_run":"d5e1d7d2692f23c064e994e8b4d771e09118710366c907025943eb04474a496c","attempt2_run":"2d5a5561f00211af0b73be530d51bb75e6daf9d2868f431b857366dba22a1ca3"},"repository":"icom-media-company/icom-deploy-reviewer","schema_version":1,"workflow_id":371811486,"workflow_path":".github/workflows/manual-db-fulfillment-signer.yml"}
 JSON
 "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-one" "$tmp/legacy-run-evidence.json" >/dev/null
 "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-two" "$tmp/legacy-run-evidence.json" >/dev/null
@@ -85,7 +113,7 @@ for spec in \
   '.attempt1_run_id=1' \
   '.attempt1_job_id=1' \
   '.attempt1_signing_step="success"' \
-  '.raw_sha256.attempt1_logs_zip="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.canonical_content_sha256.attempt1_logs="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
   '.legacy_release_updated_at="2026-10-01T00:00:00Z"' \
   '.earlier_trusted_runs=[]' \
   '.earlier_trusted_runs[1].mint_job="success"' \

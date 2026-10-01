@@ -41,8 +41,13 @@ GitHub Release `created_at` is a commit timestamp and is never treated as object
 as a cutoff. Instead, the proof uses `updated_at` inside the failed step window, exact bot
 author, an emitted untagged URL exactly equal to live `html_url`, subsequent HTTP 404, exact
 release ID/tag/body/ref, and empty durable assets. The claim deliberately does not assert
-absolute historical `prior_signing=false`. Raw logs are not bundled; their immutable SHA-256
-is recorded in signed `LEGACY-RUN-EVIDENCE.json` to avoid propagating operational logs.
+absolute historical `prior_signing=false`. Raw logs are not bundled. GitHub may regenerate
+the logs ZIP with different archive metadata, ordering, or compression, so authorization
+does not pin the raw ZIP bytes. It requires an exact safe regular-file census and records a
+canonical digest over each ordered entry name, uncompressed byte length and SHA-256 in signed
+`LEGACY-RUN-EVIDENCE.json`. Metadata-only ZIP differences therefore remain equivalent, while
+changed content, renamed entries, missing entries, extra entries, links, devices and unsafe
+paths fail closed without propagating operational logs.
 
 At supersession time, an exhaustive paginated Actions census is filtered by the exact trusted
 workflow ID/path and old control SHA. It must contain exactly runs `36816248037` attempt 1,
