@@ -79,6 +79,13 @@ jobs:
           [ "$GITHUB_SHA" = "$INPUT_CONTROL_SHA" ]
           [ "$(git rev-parse HEAD)" = "$INPUT_CONTROL_SHA" ] && [ -z "$(git status --porcelain)" ]
           [ -n "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_ACTOR" = "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_TRIGGERING_ACTOR" = "$AUTHORIZED_ACTOR" ]
+          old_control=b589d4d92200ac393a04344f2f203efe7f177e6a
+          old_tag="manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/$old_control"
+          [ "$INPUT_CONTROL_SHA" != "$old_control" ] || { echo 'FAIL: legacy control cannot run superseding workflow' >&2; exit 1; }
+          gh api "/repos/$GITHUB_REPOSITORY/releases/400681564" > "$RUNNER_TEMP/legacy-reservation.json"
+          trusted/verify_legacy_reservation.py "$RUNNER_TEMP/legacy-reservation.json"
+          gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$old_tag" > "$RUNNER_TEMP/legacy-tag.json"
+          trusted/verify_release_ref.py "$RUNNER_TEMP/legacy-tag.json" "$old_control"
           tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
           artifact="manual-db-stage-$INPUT_CANDIDATE_SHA-$INPUT_CONTROL_SHA"
           tag_exists=false; release_exists=false; reservation_valid=false; created_reservation=false
@@ -98,6 +105,7 @@ jobs:
             [ "$(jq -r .tag_name "$RUNNER_TEMP/completed-release.json")" = "$tag" ] || { echo 'FAIL: release ID/tag changed' >&2; exit 1; }
             mkdir -p "$RUNNER_TEMP/completed" "$RUNNER_TEMP/completed-root"
             if [ "$(jq -r .draft "$RUNNER_TEMP/completed-release.json")" = false ]; then
+              trusted/verify_published_release.py "$RUNNER_TEMP/completed-release.json" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA"
               trusted/verify_release_assets.py "$RUNNER_TEMP/completed-release.json" published
               for name in manual-db-bundle.tar.gz manual-db-bundle.tar.gz.sha256; do
                 asset_id="$(jq -r --arg name "$name" '.assets[]|select(.name==$name)|.id' "$RUNNER_TEMP/completed-release.json")"
@@ -134,7 +142,7 @@ jobs:
             gh api --method POST "/repos/$GITHUB_REPOSITORY/releases" \
               -f tag_name="$tag" -f target_commitish="$INPUT_CONTROL_SHA" \
               -f name='RESERVED trusted manual DB package' \
-              -f body="candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA; absent staging may resume only with byte-identical deterministic mint" \
+              -f body="candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA; supersedes_legacy_release=400681564 old_control=$old_control reason=pre-sign draft-discovery 404" \
               -F draft=true > "$RUNNER_TEMP/reserved-release.json"
             gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/reserved-tag.json"
             trusted/verify_release_ref.py "$RUNNER_TEMP/reserved-tag.json" "$INPUT_CONTROL_SHA"
@@ -239,8 +247,8 @@ jobs:
           [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
           gh api --method PATCH "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false \
             -f name='Trusted manual DB fulfillment package' \
-            -f body="candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA order=90,91,92,93" > "$RUNNER_TEMP/published-release.json"
-          [ "$(jq -r .tag_name "$RUNNER_TEMP/published-release.json")" = "$tag" ]
+            -f body="candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA order=90,91,92,93 supersedes_legacy_release=400681564 old_control=b589d4d92200ac393a04344f2f203efe7f177e6a" > "$RUNNER_TEMP/published-release.json"
+          trusted/verify_published_release.py "$RUNNER_TEMP/published-release.json" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA"
       - name: Verify permanent release bytes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -252,6 +260,7 @@ jobs:
           [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
           gh api "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/final-release.json"
           [ "$(jq -r .tag_name "$RUNNER_TEMP/final-release.json")" = "$tag" ]
+          trusted/verify_published_release.py "$RUNNER_TEMP/final-release.json" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA"
           trusted/verify_release_assets.py "$RUNNER_TEMP/final-release.json" published
           mkdir -p "$RUNNER_TEMP/final" "$RUNNER_TEMP/final-root"
           for name in manual-db-bundle.tar.gz manual-db-bundle.tar.gz.sha256; do

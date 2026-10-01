@@ -49,6 +49,14 @@ def main():
  for rel,digest in declared.items():
   path=root/rel; regular(path)
   if sha(path)!=digest: die("bundle checksum mismatch")
+ supersession=root/"LEGACY-RESERVATION-SUPERSESSION.json"; supersession_sig=root/"LEGACY-RESERVATION-SUPERSESSION.json.ci.sig"
+ regular(supersession); regular(supersession_sig)
+ if doc.get("legacy_reservation_supersession_sha256")!=sha(supersession): die("supersession metadata mismatch")
+ with supersession.open("rb") as source:
+  subprocess.run(["ssh-keygen","-Y","verify","-f",str(external),"-I","icom-deploy-ci","-n","icom-db-migration-ci","-s",str(supersession_sig)],stdin=source,check=True,stdout=subprocess.DEVNULL)
+ sup=json.loads(supersession.read_text())
+ expected={"schema_version":1,"legacy_release_id":400681564,"legacy_tag":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/b589d4d92200ac393a04344f2f203efe7f177e6a","legacy_control_sha":"b589d4d92200ac393a04344f2f203efe7f177e6a","candidate_sha":CANDIDATE,"observed_empty":True,"superseded_by_control":control,"reason":"pre-sign draft-discovery 404","prior_signing":False}
+ if sup!=expected: die("legacy supersession binding mismatch")
  evidence=root/"PROTECTED-REVIEW-EVIDENCE.json"; regular(evidence)
  if sha(evidence)!=REVIEWS_SHA: die("review evidence mismatch")
  for slug,want in zip(ORDER,MANIFESTS):

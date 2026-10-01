@@ -23,3 +23,11 @@ exact unique `tag_name`; GitHub's release-by-tag endpoint does not expose drafts
 discovery or REST creation, every release read, asset transfer and edit is bound to the
 numeric release ID. An exact tag-only crash state creates the missing draft reservation and
 continues the same idempotent identity; it never deletes the tag or reservation.
+
+The pre-sign reservation at release ID `400681564` belongs to control
+`b589d4d92200ac393a04344f2f203efe7f177e6a`, whose draft discovery failed with a 404.
+The active workflow verifies that legacy release and tag ref are exact, empty and unsigned,
+then leaves them untouched. It creates a distinct reservation under the new reviewed control
+identity. The signed bundle contains `LEGACY-RESERVATION-SUPERSESSION.json`, binding the old
+ID/tag/control and the new control. This is governed supersession, not recovery or deletion
+of the legacy reservation.

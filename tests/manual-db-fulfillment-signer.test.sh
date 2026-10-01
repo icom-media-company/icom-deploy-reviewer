@@ -6,6 +6,7 @@ ARCHIVE="$ROOT/trusted/archive_validate.py"; SELECT="$ROOT/trusted/select_stagin
 DECIDE="$ROOT/trusted/decide_mint_state.py"; ASSETS="$ROOT/trusted/verify_release_assets.py"
 RESERVATION="$ROOT/trusted/verify_reservation.py"
 SELECT_RELEASE="$ROOT/trusted/select_release.py"
+LEGACY="$ROOT/trusted/verify_legacy_reservation.py"; REF="$ROOT/trusted/verify_release_ref.py"
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); echo "PASS $1"; }; bad(){ FAIL=$((FAIL+1)); echo "FAIL $1" >&2; }
 has(){ grep -Fq "$2" "$1"; }
@@ -67,23 +68,26 @@ printf 'icom-deploy-ci %s\n' "$pub" > "$tmp/repro-control/ci-allowed-signers"
 "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-two" >/dev/null
 "$ROOT/trusted/create_reproducible_tar.py" "$tmp/build-one" "$tmp/one.tar.gz"
 "$ROOT/trusted/create_reproducible_tar.py" "$tmp/build-two" "$tmp/two.tar.gz"
-diff -qr "$tmp/build-one" "$tmp/build-two" >/dev/null && cmp "$tmp/one.tar.gz" "$tmp/two.tar.gz" >/dev/null && ok W_ed25519_signatures_and_archive_reproducible || bad W_ed25519_signatures_and_archive_reproducible
+diff -qr "$tmp/build-one" "$tmp/build-two" >/dev/null && cmp "$tmp/one.tar.gz" "$tmp/two.tar.gz" >/dev/null \
+ && test -f "$tmp/build-one/LEGACY-RESERVATION-SUPERSESSION.json.ci.sig" \
+ && jq -e '.legacy_release_id==400681564 and .observed_empty==true and .prior_signing==false and .superseded_by_control=="1111111111111111111111111111111111111111"' "$tmp/build-one/LEGACY-RESERVATION-SUPERSESSION.json" >/dev/null \
+ && ok W_ed25519_signatures_and_archive_reproducible || bad W_ed25519_signatures_and_archive_reproducible
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$tmp/wrong-key"
 ssh-keygen -q -t rsa -b 2048 -N '' -C '' -f "$tmp/rsa-key"
 ! "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/wrong-key" "$tmp/wrong-build" >/dev/null 2>&1 \
  && ! "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/rsa-key" "$tmp/rsa-build" >/dev/null 2>&1 \
  && ok X_wrong_and_non_ed25519_keys_rejected || bad X_wrong_and_non_ed25519_keys_rejected
 cat > "$tmp/reservation.json" <<'JSON'
-{"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; absent staging may resume only with byte-identical deterministic mint"}
+{"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; supersedes_legacy_release=400681564 old_control=b589d4d92200ac393a04344f2f203efe7f177e6a reason=pre-sign draft-discovery 404"}
 JSON
 "$RESERVATION" "$tmp/reservation.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111
-sed 's/byte-identical/different/' "$tmp/reservation.json" > "$tmp/reservation-bad.json"
+sed 's/supersedes_legacy_release=400681564/supersedes_legacy_release=5/' "$tmp/reservation.json" > "$tmp/reservation-bad.json"
 ! "$RESERVATION" "$tmp/reservation-bad.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 >/dev/null 2>&1 && ok Y_exact_reservation_identity || bad Y_exact_reservation_identity
 cat > "$tmp/draft-empty.json" <<'JSON'
-{"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; absent staging may resume only with byte-identical deterministic mint","assets":[]}
+{"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; supersedes_legacy_release=400681564 old_control=b589d4d92200ac393a04344f2f203efe7f177e6a reason=pre-sign draft-discovery 404","assets":[]}
 JSON
 cat > "$tmp/draft-exact.json" <<'JSON'
-{"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; absent staging may resume only with byte-identical deterministic mint","assets":[{"name":"manual-db-bundle.tar.gz.sha256"},{"name":"manual-db-bundle.tar.gz"}]}
+{"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; supersedes_legacy_release=400681564 old_control=b589d4d92200ac393a04344f2f203efe7f177e6a reason=pre-sign draft-discovery 404","assets":[{"name":"manual-db-bundle.tar.gz.sha256"},{"name":"manual-db-bundle.tar.gz"}]}
 JSON
 "$RESERVATION" "$tmp/draft-empty.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 \
  && [ "$("$DECIDE" false true true absent)" = resume_idempotent ] \
@@ -98,8 +102,8 @@ cat > "$tmp/live-releases.json" <<'JSON'
 [[{"id":400681564,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/b589d4d92200ac393a04344f2f203efe7f177e6a","draft":true,"name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=b589d4d92200ac393a04344f2f203efe7f177e6a; absent staging may resume only with byte-identical deterministic mint","assets":[]},{"id":9,"tag_name":"unrelated","draft":false,"assets":[]}],[]]
 JSON
 "$SELECT_RELEASE" "$tmp/live-releases.json" "$live_tag" > "$tmp/live-selected.json"
-"$RESERVATION" "$tmp/live-selected.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc b589d4d92200ac393a04344f2f203efe7f177e6a
-[ "$(jq -r .id "$tmp/live-selected.json")" = 400681564 ] && [ "$("$DECIDE" false true true absent)" = resume_idempotent ] && ok AA_live_draft_zero_assets_discovered || bad AA_live_draft_zero_assets_discovered
+"$LEGACY" "$tmp/live-selected.json" >/dev/null
+[ "$(jq -r .id "$tmp/live-selected.json")" = 400681564 ] && ok AA_live_legacy_reservation_verified || bad AA_live_legacy_reservation_verified
 jq '.[0] += [.[0][0]]' "$tmp/live-releases.json" > "$tmp/duplicate-releases.json"
 ! "$SELECT_RELEASE" "$tmp/duplicate-releases.json" "$live_tag" >/dev/null 2>&1 && ok AB_duplicate_exact_tag_fails || bad AB_duplicate_exact_tag_fails
 jq '.[0][0].draft=false | .[0][0].assets=[{"id":1,"name":"manual-db-bundle.tar.gz"},{"id":2,"name":"manual-db-bundle.tar.gz.sha256"}]' "$tmp/live-releases.json" > "$tmp/published-releases.json"
@@ -107,4 +111,19 @@ jq '.[0][0].draft=false | .[0][0].assets=[{"id":1,"name":"manual-db-bundle.tar.g
 set +e; "$SELECT_RELEASE" "$tmp/live-releases.json" manual-db/fulfillment/wrong/tag >/dev/null 2>&1; wrong_rc=$?; set -e
 [ "$wrong_rc" = 3 ] && ok AD_wrong_tag_ignored || bad AD_wrong_tag_ignored
 has "$WF" 'if [ "$release_exists" = false ]; then' && has "$WF" 'POST "/repos/$GITHUB_REPOSITORY/releases"' && ok AE_tag_only_creates_release_by_rest || bad AE_tag_only_creates_release_by_rest
+jq '.assets=[{"id":1,"name":"unexpected"}]' "$tmp/live-selected.json" > "$tmp/legacy-assets.json"
+jq '.draft=false' "$tmp/live-selected.json" > "$tmp/legacy-published.json"
+jq '.id=400681565' "$tmp/live-selected.json" > "$tmp/legacy-wrong-id.json"
+! "$LEGACY" "$tmp/legacy-assets.json" >/dev/null 2>&1 && ! "$LEGACY" "$tmp/legacy-published.json" >/dev/null 2>&1 && ! "$LEGACY" "$tmp/legacy-wrong-id.json" >/dev/null 2>&1 && ok AF_legacy_state_mutations_fail || bad AF_legacy_state_mutations_fail
+cat > "$tmp/legacy-ref.json" <<'JSON'
+{"object":{"type":"commit","sha":"b589d4d92200ac393a04344f2f203efe7f177e6a"}}
+JSON
+"$REF" "$tmp/legacy-ref.json" b589d4d92200ac393a04344f2f203efe7f177e6a
+sed 's/b589d4d92200ac393a04344f2f203efe7f177e6a/1111111111111111111111111111111111111111/' "$tmp/legacy-ref.json" > "$tmp/legacy-ref-wrong.json"
+! "$REF" "$tmp/legacy-ref-wrong.json" b589d4d92200ac393a04344f2f203efe7f177e6a >/dev/null 2>&1 && ok AG_legacy_ref_target_enforced || bad AG_legacy_ref_target_enforced
+! rg -n 'DELETE.*400681564|releases/400681564.*(PATCH|DELETE)|assets/400681564' "$WF" >/dev/null \
+ && has "$WF" '[ "$INPUT_CONTROL_SHA" != "$old_control" ]' && has "$M" 'LEGACY-RESERVATION-SUPERSESSION.json' \
+ && [ "$(grep -c 'name: Revalidate data and sign exact manifests' "$WF")" = 1 ] \
+ && ! "$RESERVATION" "$tmp/live-selected.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc b589d4d92200ac393a04344f2f203efe7f177e6a >/dev/null 2>&1 \
+ && ok AH_legacy_untouched_new_identity_only || bad AH_legacy_untouched_new_identity_only
 echo "PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ]
