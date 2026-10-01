@@ -17,3 +17,9 @@ to the same draft reservation; a draft with zero assets resumes the byte-identic
 draft with exactly the two expected, cryptographically verified assets is published without
 signing or re-upload. One, extra, wrongly named, or invalid assets fail closed. Every upload
 is re-downloaded and fully verified while the release is still draft, before publication.
+
+Draft releases are discovered from the authenticated, paginated releases collection by an
+exact unique `tag_name`; GitHub's release-by-tag endpoint does not expose drafts. After
+discovery or REST creation, every release read, asset transfer and edit is bound to the
+numeric release ID. An exact tag-only crash state creates the missing draft reservation and
+continues the same idempotent identity; it never deletes the tag or reservation.

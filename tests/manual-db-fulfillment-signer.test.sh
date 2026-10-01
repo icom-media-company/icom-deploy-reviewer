@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"; WF="$ROOT/.github/workflows/manual-db-
 ARCHIVE="$ROOT/trusted/archive_validate.py"; SELECT="$ROOT/trusted/select_staging_artifact.py"
 DECIDE="$ROOT/trusted/decide_mint_state.py"; ASSETS="$ROOT/trusted/verify_release_assets.py"
 RESERVATION="$ROOT/trusted/verify_reservation.py"
+SELECT_RELEASE="$ROOT/trusted/select_release.py"
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); echo "PASS $1"; }; bad(){ FAIL=$((FAIL+1)); echo "FAIL $1" >&2; }
 has(){ grep -Fq "$2" "$1"; }
@@ -18,7 +19,7 @@ fetch_block="$(sed -n '/name: Fetch exact business candidate/,/uses: actions\/up
 has "$V" 'd0819f7bacf5ee6dedca4345796a8d022ff6a5cc' && [ "$(grep -c '20261001-.*-[0-9][0-9]' "$V")" -ge 4 ] && ok G_exact_candidate_and_order || bad G_exact_candidate_and_order
 has "$V" 'd["authorization"]["operations"] != ["forward","verify"]' && ok H_rollback_not_authorized || bad H_rollback_not_authorized
 has "$V" 'pinned package mismatch' && has "$V" 'SQL hash mismatch' && has "$V" 'document hash mismatch' && ok I_hash_mutations_fail_closed || bad I_hash_mutations_fail_closed
-has "$WF" 'gh release view' && has "$WF" 'gh release create' && has "$WF" 'concurrency:' && ok J_durable_exactly_once_gate || bad J_durable_exactly_once_gate
+has "$WF" 'select_release.py' && has "$WF" 'releases/$RELEASE_ID' && has "$WF" 'concurrency:' && ! has "$WF" 'releases/tags/' && ok J_durable_exactly_once_gate || bad J_durable_exactly_once_gate
 ! rg -n 'psql|supabase db push|apply_migration' "$WF" "$V" "$M" && ok K_no_database_execution || bad K_no_database_execution
 [ "$(sha256sum "$ROOT/trusted/ci-allowed-signers"|awk '{print $1}')" = 704dc47b50f2ebbb8515b400bde88a943d967f313255a85a5bd4b1534177acd9 ] && ok L_existing_ci_trust_compatible || bad L_existing_ci_trust_compatible
 ! grep -n "run:.*\${{ inputs\.\|^[[:space:]]*.*'\${{ inputs\." "$WF" >/dev/null && ok M_inputs_not_interpolated_in_shell || bad M_inputs_not_interpolated_in_shell
@@ -92,4 +93,18 @@ JSON
  && has "$WF" 'state=release_staged' \
  && has "$WF" 'Verify draft assets before publication' \
  && ok Z_partial_state_matrix || bad Z_partial_state_matrix
+live_tag='manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/b589d4d92200ac393a04344f2f203efe7f177e6a'
+cat > "$tmp/live-releases.json" <<'JSON'
+[[{"id":400681564,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/b589d4d92200ac393a04344f2f203efe7f177e6a","draft":true,"name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=b589d4d92200ac393a04344f2f203efe7f177e6a; absent staging may resume only with byte-identical deterministic mint","assets":[]},{"id":9,"tag_name":"unrelated","draft":false,"assets":[]}],[]]
+JSON
+"$SELECT_RELEASE" "$tmp/live-releases.json" "$live_tag" > "$tmp/live-selected.json"
+"$RESERVATION" "$tmp/live-selected.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc b589d4d92200ac393a04344f2f203efe7f177e6a
+[ "$(jq -r .id "$tmp/live-selected.json")" = 400681564 ] && [ "$("$DECIDE" false true true absent)" = resume_idempotent ] && ok AA_live_draft_zero_assets_discovered || bad AA_live_draft_zero_assets_discovered
+jq '.[0] += [.[0][0]]' "$tmp/live-releases.json" > "$tmp/duplicate-releases.json"
+! "$SELECT_RELEASE" "$tmp/duplicate-releases.json" "$live_tag" >/dev/null 2>&1 && ok AB_duplicate_exact_tag_fails || bad AB_duplicate_exact_tag_fails
+jq '.[0][0].draft=false | .[0][0].assets=[{"id":1,"name":"manual-db-bundle.tar.gz"},{"id":2,"name":"manual-db-bundle.tar.gz.sha256"}]' "$tmp/live-releases.json" > "$tmp/published-releases.json"
+"$SELECT_RELEASE" "$tmp/published-releases.json" "$live_tag" > "$tmp/published-selected.json" && [ "$(jq -r .draft "$tmp/published-selected.json")" = false ] && ok AC_published_exact_discovered || bad AC_published_exact_discovered
+set +e; "$SELECT_RELEASE" "$tmp/live-releases.json" manual-db/fulfillment/wrong/tag >/dev/null 2>&1; wrong_rc=$?; set -e
+[ "$wrong_rc" = 3 ] && ok AD_wrong_tag_ignored || bad AD_wrong_tag_ignored
+has "$WF" 'if [ "$release_exists" = false ]; then' && has "$WF" 'POST "/repos/$GITHUB_REPOSITORY/releases"' && ok AE_tag_only_creates_release_by_rest || bad AE_tag_only_creates_release_by_rest
 echo "PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ]

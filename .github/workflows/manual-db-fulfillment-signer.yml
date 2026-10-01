@@ -85,12 +85,24 @@ jobs:
           if gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/tag.json" 2>/dev/null; then
             tag_exists=true; trusted/verify_release_ref.py "$RUNNER_TEMP/tag.json" "$INPUT_CONTROL_SHA"
           fi
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            release_exists=true; mkdir -p "$RUNNER_TEMP/completed" "$RUNNER_TEMP/completed-root"
-            gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/completed-release.json"
+          gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases-pages.json"
+          set +e
+          trusted/select_release.py "$RUNNER_TEMP/releases-pages.json" "$tag" > "$RUNNER_TEMP/completed-release.json"
+          select_rc=$?
+          set -e
+          [ "$select_rc" = 0 ] || [ "$select_rc" = 3 ] || { echo 'FAIL: ambiguous/invalid release discovery' >&2; exit 1; }
+          if [ "$select_rc" = 0 ]; then
+            release_exists=true; [ "$tag_exists" = true ] || { echo 'FAIL: release exists without exact tag ref' >&2; exit 1; }
+            release_id="$(jq -r .id "$RUNNER_TEMP/completed-release.json")"
+            gh api "/repos/$GITHUB_REPOSITORY/releases/$release_id" > "$RUNNER_TEMP/completed-release.json"
+            [ "$(jq -r .tag_name "$RUNNER_TEMP/completed-release.json")" = "$tag" ] || { echo 'FAIL: release ID/tag changed' >&2; exit 1; }
+            mkdir -p "$RUNNER_TEMP/completed" "$RUNNER_TEMP/completed-root"
             if [ "$(jq -r .draft "$RUNNER_TEMP/completed-release.json")" = false ]; then
               trusted/verify_release_assets.py "$RUNNER_TEMP/completed-release.json" published
-              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/completed" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256
+              for name in manual-db-bundle.tar.gz manual-db-bundle.tar.gz.sha256; do
+                asset_id="$(jq -r --arg name "$name" '.assets[]|select(.name==$name)|.id' "$RUNNER_TEMP/completed-release.json")"
+                gh api -H 'Accept: application/octet-stream' "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$RUNNER_TEMP/completed/$name"
+              done
               (cd "$RUNNER_TEMP/completed" && sha256sum -c manual-db-bundle.tar.gz.sha256)
               trusted/archive_validate.py tar "$RUNNER_TEMP/completed/manual-db-bundle.tar.gz"
               tar -xzf "$RUNNER_TEMP/completed/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/completed-root"
@@ -102,12 +114,15 @@ jobs:
             asset_count="$(jq '.assets|length' "$RUNNER_TEMP/completed-release.json")"
             if [ "$asset_count" = 2 ]; then
               trusted/verify_release_assets.py "$RUNNER_TEMP/completed-release.json" draft
-              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/completed" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256
+              for name in manual-db-bundle.tar.gz manual-db-bundle.tar.gz.sha256; do
+                asset_id="$(jq -r --arg name "$name" '.assets[]|select(.name==$name)|.id' "$RUNNER_TEMP/completed-release.json")"
+                gh api -H 'Accept: application/octet-stream' "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$RUNNER_TEMP/completed/$name"
+              done
               (cd "$RUNNER_TEMP/completed" && sha256sum -c manual-db-bundle.tar.gz.sha256)
               trusted/archive_validate.py tar "$RUNNER_TEMP/completed/manual-db-bundle.tar.gz"
               tar -xzf "$RUNNER_TEMP/completed/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/completed-root"
               trusted/verify_manual_db_bundle.py "$RUNNER_TEMP/completed-root" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" trusted/ci-allowed-signers
-              echo 'state=release_staged' >> "$GITHUB_OUTPUT"; echo 'release_exists=true' >> "$GITHUB_OUTPUT"; exit 0
+              echo 'state=release_staged' >> "$GITHUB_OUTPUT"; echo 'release_exists=true' >> "$GITHUB_OUTPUT"; echo "release_id=$release_id" >> "$GITHUB_OUTPUT"; exit 0
             fi
             [ "$asset_count" = 0 ] || { echo 'FAIL: draft reservation has partial/extra assets' >&2; exit 1; }
           fi
@@ -116,14 +131,20 @@ jobs:
               gh api --method POST "/repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$INPUT_CONTROL_SHA" >/dev/null
               tag_exists=true; created_reservation=true
             fi
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "RESERVED trusted manual DB package" --notes "candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA; absent staging may resume only with byte-identical deterministic mint"
+            gh api --method POST "/repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$tag" -f target_commitish="$INPUT_CONTROL_SHA" \
+              -f name='RESERVED trusted manual DB package' \
+              -f body="candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA; absent staging may resume only with byte-identical deterministic mint" \
+              -F draft=true > "$RUNNER_TEMP/reserved-release.json"
             gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/reserved-tag.json"
             trusted/verify_release_ref.py "$RUNNER_TEMP/reserved-tag.json" "$INPUT_CONTROL_SHA"
-            gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/reserved-release.json"
             trusted/verify_reservation.py "$RUNNER_TEMP/reserved-release.json" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA"
+            release_id="$(jq -r .id "$RUNNER_TEMP/reserved-release.json")"
+            [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || { echo 'FAIL: invalid created release ID' >&2; exit 1; }
             release_exists=true; reservation_valid=true
           fi
           echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
           gh api --method GET "/repos/$GITHUB_REPOSITORY/actions/artifacts" -f name="$artifact" > "$RUNNER_TEMP/artifacts.json"
           count="$(jq '[.artifacts[]|select(.name==$n and .expired==false)]|length' --arg n "$artifact" "$RUNNER_TEMP/artifacts.json")"
           if [ "$count" = 0 ]; then
@@ -177,40 +198,66 @@ jobs:
           retention-days: 30
       - name: Stage exact release assets
         if: steps.state.outputs.state != 'release_staged'
-        env: {GH_TOKEN: '${{ github.token }}'}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.state.outputs.release_id }}
         run: |
           set -euo pipefail
           tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
           if [ '${{ steps.state.outputs.state }}' = recover ]; then source="$RUNNER_TEMP/recovery"; else source="$RUNNER_TEMP"; fi
-          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$source/manual-db-bundle.tar.gz" "$source/manual-db-bundle.tar.gz.sha256"
+          for name in manual-db-bundle.tar.gz manual-db-bundle.tar.gz.sha256; do
+            gh api --method POST -H 'Content-Type: application/octet-stream' --input "$source/$name" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$name" >/dev/null
+          done
       - name: Verify draft assets before publication
-        env: {GH_TOKEN: '${{ github.token }}'}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.state.outputs.release_id }}
         run: |
           set -euo pipefail; tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
-          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/prepublish-release.json"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/prepublish-release.json"
+          [ "$(jq -r .tag_name "$RUNNER_TEMP/prepublish-release.json")" = "$tag" ]
           trusted/verify_reservation.py "$RUNNER_TEMP/prepublish-release.json" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA"
           trusted/verify_release_assets.py "$RUNNER_TEMP/prepublish-release.json" draft
           mkdir -p "$RUNNER_TEMP/prepublish" "$RUNNER_TEMP/prepublish-root"
-          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/prepublish" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256
+          for name in manual-db-bundle.tar.gz manual-db-bundle.tar.gz.sha256; do
+            asset_id="$(jq -r --arg name "$name" '.assets[]|select(.name==$name)|.id' "$RUNNER_TEMP/prepublish-release.json")"
+            gh api -H 'Accept: application/octet-stream' "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$RUNNER_TEMP/prepublish/$name"
+          done
           (cd "$RUNNER_TEMP/prepublish" && sha256sum -c manual-db-bundle.tar.gz.sha256)
           trusted/archive_validate.py tar "$RUNNER_TEMP/prepublish/manual-db-bundle.tar.gz"
           tar -xzf "$RUNNER_TEMP/prepublish/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/prepublish-root"
           trusted/verify_manual_db_bundle.py "$RUNNER_TEMP/prepublish-root" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" trusted/ci-allowed-signers
       - name: Publish verified durable release
-        env: {GH_TOKEN: '${{ github.token }}'}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.state.outputs.release_id }}
         run: |
           set -euo pipefail; tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
-          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --title "Trusted manual DB fulfillment package" --notes "candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA order=90,91,92,93"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api --method PATCH "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false \
+            -f name='Trusted manual DB fulfillment package' \
+            -f body="candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA order=90,91,92,93" > "$RUNNER_TEMP/published-release.json"
+          [ "$(jq -r .tag_name "$RUNNER_TEMP/published-release.json")" = "$tag" ]
       - name: Verify permanent release bytes
-        env: {GH_TOKEN: '${{ github.token }}'}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.state.outputs.release_id }}
         run: |
           set -euo pipefail; tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
           gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/final-tag.json"
           trusted/verify_release_ref.py "$RUNNER_TEMP/final-tag.json" "$INPUT_CONTROL_SHA"
-          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/final-release.json"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/final-release.json"
+          [ "$(jq -r .tag_name "$RUNNER_TEMP/final-release.json")" = "$tag" ]
           trusted/verify_release_assets.py "$RUNNER_TEMP/final-release.json" published
           mkdir -p "$RUNNER_TEMP/final" "$RUNNER_TEMP/final-root"
-          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/final" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256
+          for name in manual-db-bundle.tar.gz manual-db-bundle.tar.gz.sha256; do
+            asset_id="$(jq -r --arg name "$name" '.assets[]|select(.name==$name)|.id' "$RUNNER_TEMP/final-release.json")"
+            gh api -H 'Accept: application/octet-stream' "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$RUNNER_TEMP/final/$name"
+          done
           (cd "$RUNNER_TEMP/final" && sha256sum -c manual-db-bundle.tar.gz.sha256)
           trusted/archive_validate.py tar "$RUNNER_TEMP/final/manual-db-bundle.tar.gz"
           tar -xzf "$RUNNER_TEMP/final/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/final-root"
