@@ -57,6 +57,8 @@ def main():
   bound=evidence["packages"][idx]
   if bound.get("path")!=f"docs/deploy-candidates/{slug}" or bound.get("manifest_sha256")!=mhash or bound.get("subject_commit")!=CANDIDATE: raise SystemExit("review evidence subject mismatch")
   if (bound["final_general"]["review_id"],bound["final_general"]["evidence_sha256"],bound["final_critical"]["review_id"],bound["final_critical"]["evidence_sha256"])!=(fg,fe,cg,ce): raise SystemExit("review evidence binding mismatch")
+  if (bound["substantive_general"]["review_id"],bound["substantive_general"]["evidence_sha256"])!=(review["general_review"]["review_id"],review["general_review"]["evidence_sha256"]): raise SystemExit("general substantive registry/manifest mismatch")
+  if (bound["substantive_critical"]["review_id"],bound["substantive_critical"]["evidence_sha256"])!=(review["critical_review"]["review_id"],review["critical_review"]["evidence_sha256"]): raise SystemExit("critical substantive registry/manifest mismatch")
   for name in ("substantive_general","substantive_critical","final_general","final_critical"):
    item=bound[name]; expected_role="general" if name.endswith("general") else "critical"
    if item.get("role")!=expected_role or item.get("verdict")!="PASS": raise SystemExit("review evidence role/verdict mismatch")

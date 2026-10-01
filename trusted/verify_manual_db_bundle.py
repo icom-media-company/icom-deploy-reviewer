@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import hashlib,json,pathlib,subprocess,sys
+import hashlib,json,pathlib,re,subprocess,sys
 
 CANDIDATE="d0819f7bacf5ee6dedca4345796a8d022ff6a5cc"
 TRUST_SHA="704dc47b50f2ebbb8515b400bde88a943d967f313255a85a5bd4b1534177acd9"
@@ -17,11 +17,8 @@ def main():
  if candidate!=CANDIDATE or len(control)!=40 or any(c not in "0123456789abcdef" for c in control): die("SHA binding mismatch")
  regular(external)
  if sha(external)!=TRUST_SHA: die("external trust is not canonical")
- bundled=root/"trust/ci-allowed-signers"; regular(bundled)
- if sha(bundled)!=TRUST_SHA or bundled.read_bytes()!=external.read_bytes(): die("bundled trust mismatch")
- sums=root/"BUNDLE.SHA256SUMS"; regular(sums)
- subprocess.run(["sha256sum","-c",str(sums)],cwd=root,check=True,stdout=subprocess.DEVNULL)
  meta=root/"BUNDLE-METADATA.json"; sig=root/"BUNDLE-METADATA.json.ci.sig"; regular(meta); regular(sig)
+ # Authenticate authority and signed inventory before parsing any attacker-controlled sums.
  with meta.open("rb") as source:
   subprocess.run(["ssh-keygen","-Y","verify","-f",str(external),"-I","icom-deploy-ci","-n","icom-db-migration-ci","-s",str(sig)],stdin=source,check=True,stdout=subprocess.DEVNULL)
  doc=json.loads(meta.read_text())
@@ -37,6 +34,21 @@ def main():
   if rel not in EXCLUDED: items.append({"path":rel,"sha256":sha(p)})
  raw=json.dumps(items,sort_keys=True,separators=(",",":")).encode()
  if len(items)!=doc.get("payload_file_count") or hashlib.sha256(raw).hexdigest()!=doc.get("payload_inventory_sha256"): die("signed payload census mismatch")
+ bundled=root/"trust/ci-allowed-signers"; regular(bundled)
+ if sha(bundled)!=TRUST_SHA or bundled.read_bytes()!=external.read_bytes(): die("bundled trust mismatch")
+ sums=root/"BUNDLE.SHA256SUMS"; regular(sums)
+ expected={p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and not p.is_symlink() and p!=sums}
+ declared={}
+ for line in sums.read_text(encoding="utf-8").splitlines():
+  match=re.fullmatch(r"([0-9a-f]{64})  (\./[^\n]+)",line)
+  if not match: die("non-canonical checksum line")
+  digest,raw_path=match.groups(); rel=raw_path[2:]; path=pathlib.PurePosixPath(rel)
+  if path.is_absolute() or not rel or ".." in path.parts or "." in path.parts or path.as_posix()!=rel or rel in declared: die("unsafe/duplicate checksum path")
+  declared[rel]=digest
+ if set(declared)!=expected: die("checksum census mismatch")
+ for rel,digest in declared.items():
+  path=root/rel; regular(path)
+  if sha(path)!=digest: die("bundle checksum mismatch")
  evidence=root/"PROTECTED-REVIEW-EVIDENCE.json"; regular(evidence)
  if sha(evidence)!=REVIEWS_SHA: die("review evidence mismatch")
  for slug,want in zip(ORDER,MANIFESTS):

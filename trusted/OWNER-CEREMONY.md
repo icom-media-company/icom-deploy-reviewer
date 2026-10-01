@@ -2,7 +2,7 @@
 
 Never execute a verifier from the untrusted bundle to establish trust. Independently obtain
 the reviewed reviewer-control SHA and create a clean checkout of
-`icom-media/icom-deploy-reviewer` at that exact SHA.
+`icom-media-company/icom-deploy-reviewer` at that exact SHA.
 
 ```bash
 EXPECTED_REVIEWER_CONTROL_SHA='<independently supplied reviewed 40-hex SHA>'
@@ -14,7 +14,10 @@ BUNDLE=/path/to/extracted-bundle
 git -C /path/to/icom-deploy-reviewer worktree add --detach "$REVIEWER_CONTROL" "$EXPECTED_REVIEWER_CONTROL_SHA"
 test "$(git -C "$REVIEWER_CONTROL" rev-parse HEAD)" = "$EXPECTED_REVIEWER_CONTROL_SHA"
 test -z "$(git -C "$REVIEWER_CONTROL" status --porcelain)"
-test "$(git -C "$REVIEWER_CONTROL" remote get-url origin)" = https://github.com/icom-media/icom-deploy-reviewer.git
+case "$(git -C "$REVIEWER_CONTROL" remote get-url origin)" in
+  https://github.com/icom-media-company/icom-deploy-reviewer.git|git@github.com:icom-media-company/icom-deploy-reviewer.git) ;;
+  *) echo 'reviewer repository mismatch' >&2; exit 1 ;;
+esac
 test "$(jq -r .trusted_control_sha "$BUNDLE/BUNDLE-METADATA.json")" = "$EXPECTED_REVIEWER_CONTROL_SHA"
 "$REVIEWER_CONTROL/trusted/verify_manual_db_bundle.py" "$BUNDLE" \
   d0819f7bacf5ee6dedca4345796a8d022ff6a5cc "$EXPECTED_REVIEWER_CONTROL_SHA" \

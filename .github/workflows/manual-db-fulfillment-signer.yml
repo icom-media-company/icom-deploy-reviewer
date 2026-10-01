@@ -15,7 +15,6 @@ jobs:
     permissions: {contents: read}
     runs-on: ubuntu-latest
     env:
-      BUSINESS_TOKEN: ${{ secrets.ICOM_BUSINESS_READ_TOKEN }}
       AUTHORIZED_ACTOR: ${{ vars.ICOM_MANUAL_DB_AUTHORIZED_ACTOR }}
       INPUT_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
       INPUT_CONTROL_SHA: ${{ inputs.expected_control_sha }}
@@ -25,9 +24,9 @@ jobs:
       - name: Authorize protected reviewer control plane
         run: |
           set -euo pipefail
-          [ "$GITHUB_REPOSITORY" = icom-media/icom-deploy-reviewer ]
+          [ "$GITHUB_REPOSITORY" = icom-media-company/icom-deploy-reviewer ]
           [ "$GITHUB_REF" = refs/heads/main ]
-          [ "$GITHUB_WORKFLOW_REF" = 'icom-media/icom-deploy-reviewer/.github/workflows/manual-db-fulfillment-signer.yml@refs/heads/main' ]
+          [ "$GITHUB_WORKFLOW_REF" = 'icom-media-company/icom-deploy-reviewer/.github/workflows/manual-db-fulfillment-signer.yml@refs/heads/main' ]
           [ -n "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_ACTOR" = "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_TRIGGERING_ACTOR" = "$AUTHORIZED_ACTOR" ]
           [[ "$INPUT_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$INPUT_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -35,6 +34,8 @@ jobs:
           [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ] && [ -z "$(git status --porcelain)" ]
           [ "$INPUT_CANDIDATE_SHA" = d0819f7bacf5ee6dedca4345796a8d022ff6a5cc ]
       - name: Fetch exact business candidate as data only
+        env:
+          BUSINESS_TOKEN: ${{ secrets.ICOM_BUSINESS_READ_TOKEN }}
         run: |
           set -euo pipefail; [ -n "$BUSINESS_TOKEN" ]
           api=https://api.github.com/repos/icom-media/icom-business
@@ -72,21 +73,23 @@ jobs:
         env: {GH_TOKEN: '${{ github.token }}'}
         run: |
           set -euo pipefail
-          [ "$GITHUB_REPOSITORY" = icom-media/icom-deploy-reviewer ] && [ "$GITHUB_REF" = refs/heads/main ]
-          [ "$GITHUB_WORKFLOW_REF" = 'icom-media/icom-deploy-reviewer/.github/workflows/manual-db-fulfillment-signer.yml@refs/heads/main' ]
+          [ "$GITHUB_REPOSITORY" = icom-media-company/icom-deploy-reviewer ] && [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$GITHUB_WORKFLOW_REF" = 'icom-media-company/icom-deploy-reviewer/.github/workflows/manual-db-fulfillment-signer.yml@refs/heads/main' ]
           [[ "$INPUT_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$INPUT_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$GITHUB_SHA" = "$INPUT_CONTROL_SHA" ]
           [ "$(git rev-parse HEAD)" = "$INPUT_CONTROL_SHA" ] && [ -z "$(git status --porcelain)" ]
           [ -n "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_ACTOR" = "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_TRIGGERING_ACTOR" = "$AUTHORIZED_ACTOR" ]
           tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
           artifact="manual-db-stage-$INPUT_CANDIDATE_SHA-$INPUT_CONTROL_SHA"
-          tag_exists=false; release_exists=false
+          tag_exists=false; release_exists=false; created_reservation=false
           if gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/tag.json" 2>/dev/null; then
             tag_exists=true; trusted/verify_release_ref.py "$RUNNER_TEMP/tag.json" "$INPUT_CONTROL_SHA"
           fi
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             release_exists=true; mkdir -p "$RUNNER_TEMP/completed" "$RUNNER_TEMP/completed-root"
-            if gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/completed" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256 \
+            if gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/completed-release.json" \
+              && trusted/verify_release_assets.py "$RUNNER_TEMP/completed-release.json" \
+              && gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/completed" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256 \
               && (cd "$RUNNER_TEMP/completed" && sha256sum -c manual-db-bundle.tar.gz.sha256) \
               && trusted/archive_validate.py tar "$RUNNER_TEMP/completed/manual-db-bundle.tar.gz" \
               && tar -xzf "$RUNNER_TEMP/completed/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/completed-root" \
@@ -94,12 +97,19 @@ jobs:
               echo 'FAIL: durable verified release already exists; repeat mint denied' >&2; exit 1
             fi
           fi
+          if [ "$tag_exists" = false ] && [ "$release_exists" = false ]; then
+            gh api --method POST "/repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$INPUT_CONTROL_SHA" >/dev/null
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "RESERVED trusted manual DB package" --notes "candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA; fail closed if staging is absent"
+            gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/reserved-tag.json"
+            trusted/verify_release_ref.py "$RUNNER_TEMP/reserved-tag.json" "$INPUT_CONTROL_SHA"
+            tag_exists=true; release_exists=true; created_reservation=true
+          fi
           echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
           gh api --method GET "/repos/$GITHUB_REPOSITORY/actions/artifacts" -f name="$artifact" > "$RUNNER_TEMP/artifacts.json"
           count="$(jq '[.artifacts[]|select(.name==$n and .expired==false)]|length' --arg n "$artifact" "$RUNNER_TEMP/artifacts.json")"
           if [ "$count" = 0 ]; then
-            [ "$tag_exists" = false ] || { echo 'orphan release tag' >&2; exit 1; }
-            echo 'state=new' >> "$GITHUB_OUTPUT"; exit 0
+            state="$(trusted/decide_mint_state.py "$created_reservation" "$tag_exists" "$release_exists" absent)"
+            echo "state=$state" >> "$GITHUB_OUTPUT"; exit 0
           fi
           [ "$count" = 1 ] || { echo 'ambiguous staging artifacts' >&2; exit 1; }
           run_id="$(jq -r --arg n "$artifact" '.artifacts[]|select(.name==$n and .expired==false)|.workflow_run.id' "$RUNNER_TEMP/artifacts.json")"
@@ -112,7 +122,8 @@ jobs:
           trusted/archive_validate.py tar "$RUNNER_TEMP/recovery/manual-db-bundle.tar.gz"
           tar -xzf "$RUNNER_TEMP/recovery/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/recovery-root"
           trusted/verify_manual_db_bundle.py "$RUNNER_TEMP/recovery-root" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" trusted/ci-allowed-signers
-          echo 'state=recover' >> "$GITHUB_OUTPUT"
+          state="$(trusted/decide_mint_state.py false "$tag_exists" "$release_exists" verified)"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         if: steps.state.outputs.state == 'new'
         with:
@@ -151,17 +162,16 @@ jobs:
           set -euo pipefail
           tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
           if [ '${{ steps.state.outputs.state }}' = recover ]; then source="$RUNNER_TEMP/recovery"; else source="$RUNNER_TEMP"; fi
-          if [ '${{ steps.state.outputs.release_exists }}' = true ]; then
-            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$source/manual-db-bundle.tar.gz" "$source/manual-db-bundle.tar.gz.sha256"
-          else
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$INPUT_CONTROL_SHA" --title "Trusted manual DB fulfillment package" --notes "candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA order=90,91,92,93" "$source/manual-db-bundle.tar.gz" "$source/manual-db-bundle.tar.gz.sha256"
-          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$source/manual-db-bundle.tar.gz" "$source/manual-db-bundle.tar.gz.sha256"
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --title "Trusted manual DB fulfillment package" --notes "candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA order=90,91,92,93"
       - name: Verify permanent release bytes
         env: {GH_TOKEN: '${{ github.token }}'}
         run: |
           set -euo pipefail; tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
           gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/final-tag.json"
           trusted/verify_release_ref.py "$RUNNER_TEMP/final-tag.json" "$INPUT_CONTROL_SHA"
+          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/final-release.json"
+          trusted/verify_release_assets.py "$RUNNER_TEMP/final-release.json"
           mkdir -p "$RUNNER_TEMP/final" "$RUNNER_TEMP/final-root"
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/final" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256
           (cd "$RUNNER_TEMP/final" && sha256sum -c manual-db-bundle.tar.gz.sha256)
