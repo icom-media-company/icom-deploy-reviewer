@@ -33,10 +33,13 @@ ID/tag/control and the new control. This is governed supersession, not recovery 
 of the legacy reservation.
 
 Before supersession, the workflow downloads and pins attempt-1 run JSON, jobs JSON and logs
-ZIP for run `36821369400`, plus the cancelled attempt 2 and complete workflow history. It
-proves mint job `110237504710` failed during reservation discovery, while signing and staging
-steps were skipped. GitHub Release `created_at` is the release commit timestamp; the proof
-uses `updated_at` inside the failed step window, the bot author, emitted untagged release URL,
-subsequent HTTP 404, and empty durable assets. The claim is deliberately narrow: it does not
-assert absolute historical `prior_signing=false`. Raw logs are not bundled; their immutable
-SHA-256 is recorded in signed `LEGACY-RUN-EVIDENCE.json` to avoid propagating operational logs.
+ZIP for run `36821369400`, the cancelled attempt 2, and both earlier trusted runs
+`36816248037` and `36821338542` with their jobs. Those earlier runs are proven effectively
+validation-only: each mint job was skipped and had no steps. The evidence proves mint job
+`110237504710` failed during reservation discovery, while signing and staging were skipped.
+GitHub Release `created_at` is a commit timestamp and is never treated as object creation or
+as a cutoff. Instead, the proof uses `updated_at` inside the failed step window, exact bot
+author, an emitted untagged URL exactly equal to live `html_url`, subsequent HTTP 404, exact
+release ID/tag/body/ref, and empty durable assets. The claim deliberately does not assert
+absolute historical `prior_signing=false`. Raw logs are not bundled; their immutable SHA-256
+is recorded in signed `LEGACY-RUN-EVIDENCE.json` to avoid propagating operational logs.

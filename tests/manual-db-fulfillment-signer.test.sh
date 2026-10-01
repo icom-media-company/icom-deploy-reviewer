@@ -65,7 +65,7 @@ ssh-keygen -q -t ed25519 -N '' -C '' -f "$tmp/repro-key"
 pub="$(ssh-keygen -y -f "$tmp/repro-key" | awk '{print $1" "$2}')"
 printf 'icom-deploy-ci %s\n' "$pub" > "$tmp/repro-control/ci-allowed-signers"
 cat > "$tmp/legacy-run-evidence.json" <<'JSON'
-{"attempt1_failed_step":"Re-authorize signer and resolve durable state","attempt1_job_id":110237504710,"attempt1_run_id":36821369400,"attempt1_signing_step":"skipped","attempt1_staging_step":"skipped","attempt2_conclusion":"cancelled","legacy_release_assets_empty_at_supersession":true,"legacy_release_author":"github-actions[bot]","legacy_release_created_at_commit_timestamp":"2026-10-01T04:39:32Z","legacy_release_id":400681564,"legacy_release_updated_at":"2026-10-01T05:47:07Z","no_trusted_signing_workflow_run_before_release_creation":true,"post_create_lookup_http_status":404,"raw_sha256":{"attempt1_jobs":"6ee7d03e4c4948474ba8f6727937c1e1f0aacc80a543b2ebe5dcec26dd12d5f2","attempt1_logs_zip":"51c304d815452b48aad45337dcfcd9a60f4542f1100363f181e694370bb54c74","attempt1_run":"d5e1d7d2692f23c064e994e8b4d771e09118710366c907025943eb04474a496c","attempt2_run":"2d5a5561f00211af0b73be530d51bb75e6daf9d2868f431b857366dba22a1ca3"},"repository":"icom-media-company/icom-deploy-reviewer","schema_version":1,"workflow_id":371811486,"workflow_path":".github/workflows/manual-db-fulfillment-signer.yml"}
+{"attempt1_failed_step":"Re-authorize signer and resolve durable state","attempt1_job_id":110237504710,"attempt1_run_id":36821369400,"attempt1_signing_step":"skipped","attempt1_staging_step":"skipped","attempt2_conclusion":"cancelled","earlier_trusted_runs":[{"effective_mode":"validation_only","jobs_sha256":"87a962c3d3642ac7fd252f385ece3fad01862a6bee7df2ae023a3e77d9f71243","mint_job":"skipped","run_id":36816248037,"run_sha256":"6b491e96ac2d129a9ad48d90df36bc33f995e0bf9cbc6a106e9d8d9e062101e5"},{"effective_mode":"validation_only","jobs_sha256":"33d193426feadaaf2092e2ca9561a081c542acf2b17f9f85d6ca227996920277","mint_job":"skipped","run_id":36821338542,"run_sha256":"84ad3bc2291031006d3c41376e51b8a8b501adade2da8effd3085728f627e6c9"}],"legacy_release_assets_empty_at_supersession":true,"legacy_release_author":"github-actions[bot]","legacy_release_html_url":"https://github.com/icom-media-company/icom-deploy-reviewer/releases/tag/untagged-f9eb7bff73f2e9e57c0b","legacy_release_id":400681564,"legacy_release_tag":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/b589d4d92200ac393a04344f2f203efe7f177e6a","legacy_release_updated_at":"2026-10-01T05:47:07Z","legacy_tag_target":"b589d4d92200ac393a04344f2f203efe7f177e6a","post_create_lookup_http_status":404,"raw_sha256":{"attempt1_jobs":"6ee7d03e4c4948474ba8f6727937c1e1f0aacc80a543b2ebe5dcec26dd12d5f2","attempt1_logs_zip":"51c304d815452b48aad45337dcfcd9a60f4542f1100363f181e694370bb54c74","attempt1_run":"d5e1d7d2692f23c064e994e8b4d771e09118710366c907025943eb04474a496c","attempt2_run":"2d5a5561f00211af0b73be530d51bb75e6daf9d2868f431b857366dba22a1ca3"},"repository":"icom-media-company/icom-deploy-reviewer","schema_version":1,"workflow_id":371811486,"workflow_path":".github/workflows/manual-db-fulfillment-signer.yml"}
 JSON
 "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-one" "$tmp/legacy-run-evidence.json" >/dev/null
 "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-two" "$tmp/legacy-run-evidence.json" >/dev/null
@@ -86,12 +86,19 @@ for spec in \
   '.attempt1_job_id=1' \
   '.attempt1_signing_step="success"' \
   '.raw_sha256.attempt1_logs_zip="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
-  '.legacy_release_updated_at="2026-10-01T00:00:00Z"'; do
+  '.legacy_release_updated_at="2026-10-01T00:00:00Z"' \
+  '.earlier_trusted_runs=[]' \
+  '.earlier_trusted_runs[1].mint_job="success"' \
+  '.legacy_release_html_url="https://github.com/wrong/release"' \
+  '.legacy_release_id=1'; do
   index="$(printf '%s' "$spec" | shasum -a 256 | cut -c1-8)"
   jq -c "$spec" "$tmp/legacy-run-evidence.json" > "$tmp/legacy-mutated-$index.json"
   if "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/mutated-build-$index" "$tmp/legacy-mutated-$index.json" >/dev/null 2>&1; then legacy_mutations_pass=false; fi
 done
 [ "$legacy_mutations_pass" = true ] && ok X2_run_job_step_log_timestamp_mutations_rejected || bad X2_run_job_step_log_timestamp_mutations_rejected
+jq -e 'has("legacy_release_created_at_commit_timestamp")|not' "$tmp/legacy-run-evidence.json" >/dev/null \
+ && ! rg -n 'dt\(release\["created_at"\]\)|created_at.*failed step|created_at.*job' "$ROOT/trusted/verify_legacy_run_evidence.py" >/dev/null \
+ && ok X3_created_at_not_used_as_creation_cutoff || bad X3_created_at_not_used_as_creation_cutoff
 cat > "$tmp/reservation.json" <<'JSON'
 {"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; supersedes_legacy_release=400681564 old_control=b589d4d92200ac393a04344f2f203efe7f177e6a reason=pre-sign draft-discovery 404"}
 JSON

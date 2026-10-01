@@ -90,13 +90,18 @@ jobs:
           gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36821369400/attempts/1/jobs?per_page=100" > "$RUNNER_TEMP/legacy-attempt1-jobs.json"
           gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36821369400/attempts/1/logs" > "$RUNNER_TEMP/legacy-attempt1-logs.zip"
           gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36821369400/attempts/2" > "$RUNNER_TEMP/legacy-attempt2-run.json"
-          gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/actions/workflows/371811486/runs?per_page=100" > "$RUNNER_TEMP/legacy-workflow-history.json"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36816248037" > "$RUNNER_TEMP/legacy-prior1-run.json"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36816248037/jobs?per_page=100" > "$RUNNER_TEMP/legacy-prior1-jobs.json"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36821338542" > "$RUNNER_TEMP/legacy-prior2-run.json"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36821338542/jobs?per_page=100" > "$RUNNER_TEMP/legacy-prior2-jobs.json"
           trusted/verify_legacy_run_evidence.py \
             "$RUNNER_TEMP/legacy-attempt1-run.json" "$RUNNER_TEMP/legacy-attempt1-jobs.json" \
             "$RUNNER_TEMP/legacy-attempt1-logs.zip" "$RUNNER_TEMP/legacy-attempt2-run.json" \
-            "$RUNNER_TEMP/legacy-reservation.json" "$RUNNER_TEMP/legacy-workflow-history.json" \
+            "$RUNNER_TEMP/legacy-reservation.json" "$RUNNER_TEMP/legacy-tag.json" \
+            "$RUNNER_TEMP/legacy-prior1-run.json" "$RUNNER_TEMP/legacy-prior1-jobs.json" \
+            "$RUNNER_TEMP/legacy-prior2-run.json" "$RUNNER_TEMP/legacy-prior2-jobs.json" \
             "$AUTHORIZED_ACTOR" > "$RUNNER_TEMP/legacy-run-evidence.json"
-          [ "$(sha256sum "$RUNNER_TEMP/legacy-run-evidence.json" | awk '{print $1}')" = 57b418667e80adf9ef0932308af202d3448342ceae342454f7417cb438ddce47 ]
+          [ "$(sha256sum "$RUNNER_TEMP/legacy-run-evidence.json" | awk '{print $1}')" = 3348b663365841c3f0fc9e8c94eebc507ffc40c210ba9e661021f976ea043b2f ]
           tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
           artifact="manual-db-stage-$INPUT_CANDIDATE_SHA-$INPUT_CONTROL_SHA"
           tag_exists=false; release_exists=false; reservation_valid=false; created_reservation=false
