@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import hashlib,json,pathlib,re,stat,sys,zipfile
 from datetime import datetime
-if len(sys.argv)!=12: raise SystemExit("usage: verify_legacy_run_evidence.py attempt1-run attempt1-jobs logs.zip attempt2-run release tag-ref prior1-run prior1-jobs prior2-run prior2-jobs authorized-actor")
-runp,jobsp,logzipp,run2p,releasep,refp,prior1p,prior1jobsp,prior2p,prior2jobsp,authorized=sys.argv[1:]
+if len(sys.argv)!=13: raise SystemExit("usage: verify_legacy_run_evidence.py attempt1-run attempt1-jobs logs.zip attempt2-run release tag-ref prior1-run prior1-jobs prior2-run prior2-jobs paginated-census authorized-actor")
+runp,jobsp,logzipp,run2p,releasep,refp,prior1p,prior1jobsp,prior2p,prior2jobsp,censusp,authorized=sys.argv[1:]
 def raw(path): return pathlib.Path(path).read_bytes()
 def load(path): return json.loads(raw(path))
 def sha(path): return hashlib.sha256(raw(path)).hexdigest()
@@ -52,6 +52,19 @@ for run_path,jobs_path,run_id,created in ((prior1p,prior1jobsp,36816248037,"2026
  validate=[j for j in prior_jobs.get("jobs",[]) if j.get("name")=="validate-data"]
  if len(mint)!=1 or mint[0].get("conclusion")!="skipped" or mint[0].get("steps")!=[] or len(validate)!=1 or validate[0].get("conclusion")!="success": raise SystemExit("prior run was not validation-only")
  prior.append({"run_id":run_id,"effective_mode":"validation_only","mint_job":"skipped","run_sha256":pins[run_path],"jobs_sha256":pins[jobs_path]})
-selected={"schema_version":1,"repository":"icom-media-company/icom-deploy-reviewer","workflow_id":371811486,"workflow_path":expected_run["path"],"legacy_release_id":400681564,"legacy_release_updated_at":release["updated_at"],"legacy_release_author":"github-actions[bot]","legacy_release_assets_empty_at_supersession":True,"legacy_release_html_url":release["html_url"],"legacy_release_tag":tag,"legacy_tag_target":old,"attempt1_run_id":36821369400,"attempt1_job_id":110237504710,"attempt1_failed_step":"Re-authorize signer and resolve durable state","attempt1_signing_step":"skipped","attempt1_staging_step":"skipped","attempt2_conclusion":"cancelled","post_create_lookup_http_status":404,"earlier_trusted_runs":prior,"raw_sha256":{"attempt1_run":pins[runp],"attempt1_jobs":pins[jobsp],"attempt1_logs_zip":pins[logzipp],"attempt2_run":pins[run2p]}}
+pages=load(censusp)
+if not isinstance(pages,list): raise SystemExit("invalid paginated census")
+census_runs=[]
+for page in pages:
+ if not isinstance(page,dict) or not isinstance(page.get("workflow_runs"),list): raise SystemExit("invalid census page")
+ census_runs.extend(r for r in page["workflow_runs"] if r.get("workflow_id")==371811486 and r.get("path")==expected_run["path"] and r.get("head_sha")==old)
+if len(census_runs)!=3 or {r.get("id") for r in census_runs}!={36816248037,36821338542,36821369400}: raise SystemExit("legacy control workflow run census mismatch")
+by_id={r["id"]:r for r in census_runs}
+expected_listed={36816248037:(1,"success"),36821338542:(1,"success"),36821369400:(2,"cancelled")}
+for rid,(attempt,conclusion) in expected_listed.items():
+ if by_id[rid].get("run_attempt")!=attempt or by_id[rid].get("status")!="completed" or by_id[rid].get("conclusion")!=conclusion: raise SystemExit("legacy census state mismatch")
+census=[{"run_id":rid,"listed_run_attempt":expected_listed[rid][0],"verified_attempts":[1,2] if rid==36821369400 else [1]} for rid in sorted(expected_listed)]
+census_raw=json.dumps(census,sort_keys=True,separators=(",",":")).encode(); census_sha=hashlib.sha256(census_raw).hexdigest()
+selected={"schema_version":1,"repository":"icom-media-company/icom-deploy-reviewer","workflow_id":371811486,"workflow_path":expected_run["path"],"legacy_release_id":400681564,"legacy_release_updated_at":release["updated_at"],"legacy_release_author":"github-actions[bot]","legacy_release_assets_empty_at_supersession":True,"legacy_release_html_url":release["html_url"],"legacy_release_tag":tag,"legacy_tag_target":old,"attempt1_run_id":36821369400,"attempt1_job_id":110237504710,"attempt1_failed_step":"Re-authorize signer and resolve durable state","attempt1_signing_step":"skipped","attempt1_staging_step":"skipped","attempt2_conclusion":"cancelled","post_create_lookup_http_status":404,"earlier_trusted_runs":prior,"legacy_control_workflow_run_census":census,"legacy_control_workflow_run_census_sha256":census_sha,"raw_sha256":{"attempt1_run":pins[runp],"attempt1_jobs":pins[jobsp],"attempt1_logs_zip":pins[logzipp],"attempt2_run":pins[run2p]}}
 encoded=json.dumps(selected,sort_keys=True,separators=(",",":"))
 print(encoded)

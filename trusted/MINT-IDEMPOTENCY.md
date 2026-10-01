@@ -43,3 +43,9 @@ author, an emitted untagged URL exactly equal to live `html_url`, subsequent HTT
 release ID/tag/body/ref, and empty durable assets. The claim deliberately does not assert
 absolute historical `prior_signing=false`. Raw logs are not bundled; their immutable SHA-256
 is recorded in signed `LEGACY-RUN-EVIDENCE.json` to avoid propagating operational logs.
+
+At supersession time, an exhaustive paginated Actions census is filtered by the exact trusted
+workflow ID/path and old control SHA. It must contain exactly runs `36816248037` attempt 1,
+`36821338542` attempt 1, and `36821369400` with verified attempts 1 and 2. Any additional or
+omitted old-control run fails closed. The canonical census and its digest are included in the
+signed evidence; this census is identity-based and never uses `created_at` as a cutoff.
