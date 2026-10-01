@@ -1,0 +1,107 @@
+name: Trusted manual DB fulfillment signer
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha: {description: Exact business candidate SHA, required: true, type: string}
+      expected_control_sha: {description: Exact reviewed signer control SHA, required: true, type: string}
+      validation_only: {description: Validate only without signing or mint, required: true, default: true, type: boolean}
+permissions: {}
+concurrency:
+  group: trusted-manual-db-${{ inputs.candidate_sha }}-${{ inputs.expected_control_sha }}
+  cancel-in-progress: false
+jobs:
+  validate-data:
+    environment: read-business
+    permissions: {contents: read}
+    runs-on: ubuntu-latest
+    env:
+      BUSINESS_TOKEN: ${{ secrets.ICOM_BUSINESS_READ_TOKEN }}
+      AUTHORIZED_ACTOR: ${{ vars.ICOM_MANUAL_DB_AUTHORIZED_ACTOR }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0}
+      - name: Authorize protected reviewer control plane
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = icom-media/icom-deploy-reviewer ]
+          [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$GITHUB_WORKFLOW_REF" = 'icom-media/icom-deploy-reviewer/.github/workflows/manual-db-fulfillment-signer.yml@refs/heads/main' ]
+          [ -n "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_ACTOR" = "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_TRIGGERING_ACTOR" = "$AUTHORIZED_ACTOR" ]
+          [ "$GITHUB_SHA" = '${{ inputs.expected_control_sha }}' ]
+          [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ] && [ -z "$(git status --porcelain)" ]
+          [ '${{ inputs.candidate_sha }}' = d0819f7bacf5ee6dedca4345796a8d022ff6a5cc ]
+      - name: Fetch exact business candidate as data only
+        run: |
+          set -euo pipefail; [ -n "$BUSINESS_TOKEN" ]
+          api=https://api.github.com/repos/icom-media/icom-business
+          actual="$(curl -fsSL -H "Authorization: Bearer $BUSINESS_TOKEN" -H 'Accept: application/vnd.github+json' "$api/commits/${{ inputs.candidate_sha }}" | jq -r .sha)"
+          [ "$actual" = '${{ inputs.candidate_sha }}' ]
+          curl -fsSL -H "Authorization: Bearer $BUSINESS_TOKEN" -H 'Accept: application/vnd.github+json' "$api/tarball/$actual" -o "$RUNNER_TEMP/candidate.tar.gz"
+          python3 - "$RUNNER_TEMP/candidate.tar.gz" <<'PY'
+          import pathlib,sys,tarfile
+          with tarfile.open(sys.argv[1],"r:gz") as f:
+           for m in f.getmembers():
+            p=pathlib.PurePosixPath(m.name)
+            if p.is_absolute() or ".." in p.parts or m.issym() or m.islnk(): raise SystemExit("unsafe candidate archive")
+          PY
+          mkdir "$RUNNER_TEMP/candidate"; tar -xzf "$RUNNER_TEMP/candidate.tar.gz" -C "$RUNNER_TEMP/candidate" --strip-components=1
+          trusted/manual_db_validate.py "$actual" "$RUNNER_TEMP/candidate" > "$RUNNER_TEMP/validation.json"
+          tar -czf "$RUNNER_TEMP/validated-candidate.tar.gz" -C "$RUNNER_TEMP/candidate" .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: inputs.validation_only == false
+        with:
+          name: validated-manual-db-${{ inputs.candidate_sha }}-${{ inputs.expected_control_sha }}
+          path: |
+            ${{ runner.temp }}/validated-candidate.tar.gz
+            ${{ runner.temp }}/validation.json
+          if-no-files-found: error
+          retention-days: 1
+  mint:
+    if: inputs.validation_only == false
+    needs: validate-data
+    environment: manual-db-sign
+    permissions: {actions: read, contents: write}
+    runs-on: ubuntu-latest
+    env:
+      AUTHORIZED_ACTOR: ${{ vars.ICOM_MANUAL_DB_AUTHORIZED_ACTOR }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0}
+      - name: Re-authorize signer and deny completed mint
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = icom-media/icom-deploy-reviewer ] && [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$GITHUB_SHA" = '${{ inputs.expected_control_sha }}' ]
+          [ -n "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_ACTOR" = "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_TRIGGERING_ACTOR" = "$AUTHORIZED_ACTOR" ]
+          tag='manual-db/fulfillment/${{ inputs.candidate_sha }}/${{ inputs.expected_control_sha }}'
+          ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-manual-db-${{ inputs.candidate_sha }}-${{ inputs.expected_control_sha }}
+          path: ${{ runner.temp }}/handoff
+      - name: Revalidate data and sign exact manifests
+        env:
+          SIGNING_KEY: ${{ secrets.ICOM_DEPLOY_CI_SIGNING_KEY }}
+        run: |
+          set -euo pipefail; [ -n "$SIGNING_KEY" ]; umask 077
+          key="$RUNNER_TEMP/ci-key"; cleanup(){ shred -u "$key" 2>/dev/null || rm -f "$key"; }; trap cleanup EXIT
+          printf '%s\n' "$SIGNING_KEY" > "$key"; chmod 600 "$key"
+          python3 - "$RUNNER_TEMP/handoff/validated-candidate.tar.gz" <<'PY'
+          import pathlib,sys,tarfile
+          with tarfile.open(sys.argv[1],"r:gz") as f:
+           for m in f.getmembers():
+            p=pathlib.PurePosixPath(m.name)
+            if p.is_absolute() or ".." in p.parts or m.issym() or m.islnk(): raise SystemExit("unsafe handoff archive")
+          PY
+          mkdir "$RUNNER_TEMP/candidate"; tar -xzf "$RUNNER_TEMP/handoff/validated-candidate.tar.gz" -C "$RUNNER_TEMP/candidate"
+          trusted/manual_db_validate.py '${{ inputs.candidate_sha }}' "$RUNNER_TEMP/candidate" >/dev/null
+          trusted/mint_manual_db_bundle.sh "$RUNNER_TEMP/candidate" '${{ inputs.candidate_sha }}' '${{ inputs.expected_control_sha }}' "$key" "$RUNNER_TEMP/bundle"
+          tar -czf "$RUNNER_TEMP/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/bundle" .
+          (cd "$RUNNER_TEMP" && sha256sum manual-db-bundle.tar.gz > manual-db-bundle.tar.gz.sha256)
+      - name: Publish durable exactly-once release
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          set -euo pipefail
+          tag='manual-db/fulfillment/${{ inputs.candidate_sha }}/${{ inputs.expected_control_sha }}'
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target '${{ inputs.expected_control_sha }}' --title "Trusted manual DB fulfillment package" --notes "candidate=${{ inputs.candidate_sha }} control=${{ inputs.expected_control_sha }} order=90,91,92,93" "$RUNNER_TEMP/manual-db-bundle.tar.gz" "$RUNNER_TEMP/manual-db-bundle.tar.gz.sha256"
