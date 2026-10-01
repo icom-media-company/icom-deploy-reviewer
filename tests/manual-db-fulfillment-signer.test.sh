@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; WF="$ROOT/.github/workflows/manual-db-fulfillment-signer.yml"; V="$ROOT/trusted/manual_db_validate.py"; M="$ROOT/trusted/mint_manual_db_bundle.sh"
 ARCHIVE="$ROOT/trusted/archive_validate.py"; SELECT="$ROOT/trusted/select_staging_artifact.py"
 DECIDE="$ROOT/trusted/decide_mint_state.py"; ASSETS="$ROOT/trusted/verify_release_assets.py"
+RESERVATION="$ROOT/trusted/verify_reservation.py"
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); echo "PASS $1"; }; bad(){ FAIL=$((FAIL+1)); echo "FAIL $1" >&2; }
 has(){ grep -Fq "$2" "$1"; }
@@ -49,7 +50,7 @@ sed -i.bak 's/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/aaaaaaaaaaaaaaaaaaaaaaaaa
 ! "$tmp/trusted/manual_db_validate.py" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc /tmp/icom-db-package >/dev/null 2>&1 && ok S_swapped_review_candidate_rejected || bad S_swapped_review_candidate_rejected
 mkdir "$tmp/empty"; printf 'attacker ssh-ed25519 AAAA\n' > "$tmp/attacker-trust"
 ! "$ROOT/trusted/verify_manual_db_bundle.py" "$tmp/empty" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$tmp/attacker-trust" >/dev/null 2>&1 && ok T_external_trust_precedes_bundle_signature || bad T_external_trust_precedes_bundle_signature
-[ "$("$DECIDE" true true true absent)" = new ] && ! "$DECIDE" false true true absent >/dev/null 2>&1 && ! "$DECIDE" false true true absent >/dev/null 2>&1 && [ "$("$DECIDE" false true true verified)" = recover ] && ok U_reservation_crashes_never_resign || bad U_reservation_crashes_never_resign
+[ "$("$DECIDE" true true true absent)" = new ] && [ "$("$DECIDE" false true true absent)" = resume_idempotent ] && [ "$("$DECIDE" false true true absent)" != new ] && [ "$("$DECIDE" false true true verified)" = recover ] && ok U_reservation_crashes_resume_same_identity || bad U_reservation_crashes_resume_same_identity
 cat > "$tmp/release-good.json" <<'JSON'
 {"draft":false,"assets":[{"name":"manual-db-bundle.tar.gz.sha256"},{"name":"manual-db-bundle.tar.gz"}]}
 JSON
@@ -57,4 +58,24 @@ cat > "$tmp/release-extra.json" <<'JSON'
 {"draft":false,"assets":[{"name":"manual-db-bundle.tar.gz.sha256"},{"name":"manual-db-bundle.tar.gz"},{"name":"evil"}]}
 JSON
 "$ASSETS" "$tmp/release-good.json" && ! "$ASSETS" "$tmp/release-extra.json" >/dev/null 2>&1 && ok V_release_asset_exact_census || bad V_release_asset_exact_census
+cp -R "$ROOT/trusted" "$tmp/repro-control"
+ssh-keygen -q -t ed25519 -N '' -C '' -f "$tmp/repro-key"
+pub="$(ssh-keygen -y -f "$tmp/repro-key" | awk '{print $1" "$2}')"
+printf 'icom-deploy-ci %s\n' "$pub" > "$tmp/repro-control/ci-allowed-signers"
+"$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-one" >/dev/null
+"$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-two" >/dev/null
+"$ROOT/trusted/create_reproducible_tar.py" "$tmp/build-one" "$tmp/one.tar.gz"
+"$ROOT/trusted/create_reproducible_tar.py" "$tmp/build-two" "$tmp/two.tar.gz"
+diff -qr "$tmp/build-one" "$tmp/build-two" >/dev/null && cmp "$tmp/one.tar.gz" "$tmp/two.tar.gz" >/dev/null && ok W_ed25519_signatures_and_archive_reproducible || bad W_ed25519_signatures_and_archive_reproducible
+ssh-keygen -q -t ed25519 -N '' -C '' -f "$tmp/wrong-key"
+ssh-keygen -q -t rsa -b 2048 -N '' -C '' -f "$tmp/rsa-key"
+! "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/wrong-key" "$tmp/wrong-build" >/dev/null 2>&1 \
+ && ! "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/rsa-key" "$tmp/rsa-build" >/dev/null 2>&1 \
+ && ok X_wrong_and_non_ed25519_keys_rejected || bad X_wrong_and_non_ed25519_keys_rejected
+cat > "$tmp/reservation.json" <<'JSON'
+{"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; absent staging may resume only with byte-identical deterministic mint"}
+JSON
+"$RESERVATION" "$tmp/reservation.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111
+sed 's/byte-identical/different/' "$tmp/reservation.json" > "$tmp/reservation-bad.json"
+! "$RESERVATION" "$tmp/reservation-bad.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 >/dev/null 2>&1 && ok Y_exact_reservation_identity || bad Y_exact_reservation_identity
 echo "PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ]
