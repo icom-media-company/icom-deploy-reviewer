@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+import hashlib,json,pathlib,subprocess,sys
+
+CANDIDATE="d0819f7bacf5ee6dedca4345796a8d022ff6a5cc"
+TRUST_SHA="704dc47b50f2ebbb8515b400bde88a943d967f313255a85a5bd4b1534177acd9"
+REVIEWS_SHA="8144533067199f1df88b7ec2a7623275d9934feeaebd48f14b4dfa329dc12bc9"
+ORDER=["20261001-fulfillment-retry-90","20261001-pgsodium-prerequisite-91","20261001-fulfillment-historical-evidence-92","20261001-mto-claim-93"]
+MANIFESTS=["2dff21f4ddb83ea52905420994c238eaf517e9bbbb6009b6086db87356612f44","0cb36140d395a8c3b8468485e13ab91e25d75a966cef93300b90e5009c5da6fa","f4a4f6e4ae1a5bfa0d441829cf7bb68dd8d6c81ce1a8c28a6e653bba70b8873e","24882dc7d6d450c1b2c86638ca9084dbd7e67302684518fd9c2f352dacfa3b65"]
+EXCLUDED=["BUNDLE-METADATA.json","BUNDLE-METADATA.json.ci.sig","BUNDLE.SHA256SUMS"]
+def die(s): raise SystemExit(s)
+def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+def regular(p):
+ if p.is_symlink() or not p.is_file(): die(f"unsafe/missing file: {p}")
+def main():
+ if len(sys.argv)!=5: die("usage: verify_manual_db_bundle.py ROOT CANDIDATE CONTROL EXTERNAL_TRUST")
+ root=pathlib.Path(sys.argv[1]).resolve(); candidate,control=sys.argv[2:4]; external=pathlib.Path(sys.argv[4])
+ if candidate!=CANDIDATE or len(control)!=40 or any(c not in "0123456789abcdef" for c in control): die("SHA binding mismatch")
+ regular(external)
+ if sha(external)!=TRUST_SHA: die("external trust is not canonical")
+ bundled=root/"trust/ci-allowed-signers"; regular(bundled)
+ if sha(bundled)!=TRUST_SHA or bundled.read_bytes()!=external.read_bytes(): die("bundled trust mismatch")
+ sums=root/"BUNDLE.SHA256SUMS"; regular(sums)
+ subprocess.run(["sha256sum","-c",str(sums)],cwd=root,check=True,stdout=subprocess.DEVNULL)
+ meta=root/"BUNDLE-METADATA.json"; sig=root/"BUNDLE-METADATA.json.ci.sig"; regular(meta); regular(sig)
+ with meta.open("rb") as source:
+  subprocess.run(["ssh-keygen","-Y","verify","-f",str(external),"-I","icom-deploy-ci","-n","icom-db-migration-ci","-s",str(sig)],stdin=source,check=True,stdout=subprocess.DEVNULL)
+ doc=json.loads(meta.read_text())
+ if doc.get("candidate_sha")!=candidate or doc.get("trusted_control_sha")!=control or doc.get("execution_control_sha")!="96722ad7c5c285deb4c636dfff76e6cefa7e5c04": die("metadata provenance mismatch")
+ if doc.get("review_evidence_sha256")!=REVIEWS_SHA or doc.get("package_order")!=ORDER or doc.get("authorized_operations")!=["forward","verify"] or doc.get("sql_executed") is not False: die("metadata scope mismatch")
+ if doc.get("payload_inventory_exclusions")!=EXCLUDED: die("inventory exclusion mismatch")
+ items=[]
+ for p in sorted(root.rglob("*")):
+  if p.is_symlink(): die("symlink forbidden")
+  if p.is_dir(): continue
+  if not p.is_file(): die("non-regular payload")
+  rel=p.relative_to(root).as_posix()
+  if rel not in EXCLUDED: items.append({"path":rel,"sha256":sha(p)})
+ raw=json.dumps(items,sort_keys=True,separators=(",",":")).encode()
+ if len(items)!=doc.get("payload_file_count") or hashlib.sha256(raw).hexdigest()!=doc.get("payload_inventory_sha256"): die("signed payload census mismatch")
+ evidence=root/"PROTECTED-REVIEW-EVIDENCE.json"; regular(evidence)
+ if sha(evidence)!=REVIEWS_SHA: die("review evidence mismatch")
+ for slug,want in zip(ORDER,MANIFESTS):
+  manifest=root/"docs/deploy-candidates"/slug/"candidate-manifest.json"; msig=pathlib.Path(str(manifest)+".ci.sig")
+  regular(manifest); regular(msig)
+  if sha(manifest)!=want: die("manifest mismatch")
+  with manifest.open("rb") as source:
+   subprocess.run(["ssh-keygen","-Y","verify","-f",str(external),"-I","icom-deploy-ci","-n","icom-db-migration-ci","-s",str(msig)],stdin=source,check=True,stdout=subprocess.DEVNULL)
+ print("MANUAL_DB_BUNDLE_VERIFY=PASS")
+if __name__=="__main__": main()

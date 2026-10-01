@@ -30,6 +30,10 @@ def safe(root, rel):
 def main():
  if len(sys.argv)!=3 or sys.argv[1]!=CANDIDATE: raise SystemExit("exact candidate SHA required")
  root=pathlib.Path(sys.argv[2]); report=[]
+ evidence_path=pathlib.Path(__file__).with_name("manual-db-review-bindings.json")
+ if sha(evidence_path)!="8144533067199f1df88b7ec2a7623275d9934feeaebd48f14b4dfa329dc12bc9": raise SystemExit("protected review evidence hash mismatch")
+ evidence=load(evidence_path)
+ if evidence.get("candidate_sha")!=CANDIDATE or len(evidence.get("packages",[]))!=4: raise SystemExit("review evidence candidate mismatch")
  for idx,(slug,mhash,phash) in enumerate(PACKAGES):
   package=root/"docs/deploy-candidates"/slug; manifest=package/"candidate-manifest.json"
   if sha(manifest)!=mhash or sha(package/"PACKAGE.SHA256SUMS")!=phash: raise SystemExit(f"pinned package mismatch: {slug}")
@@ -50,6 +54,12 @@ def main():
   for role in ("general_review","critical_review"):
    if review[role]["verdict"]!="PASS" or not re.fullmatch(r"[0-9a-f]{40}",review[role]["review_id"]): raise SystemExit("substantive review mismatch")
   fg,fe,cg,ce=FINAL[idx]
+  bound=evidence["packages"][idx]
+  if bound.get("path")!=f"docs/deploy-candidates/{slug}" or bound.get("manifest_sha256")!=mhash or bound.get("subject_commit")!=CANDIDATE: raise SystemExit("review evidence subject mismatch")
+  if (bound["final_general"]["review_id"],bound["final_general"]["evidence_sha256"],bound["final_critical"]["review_id"],bound["final_critical"]["evidence_sha256"])!=(fg,fe,cg,ce): raise SystemExit("review evidence binding mismatch")
+  for name in ("substantive_general","substantive_critical","final_general","final_critical"):
+   item=bound[name]; expected_role="general" if name.endswith("general") else "critical"
+   if item.get("role")!=expected_role or item.get("verdict")!="PASS": raise SystemExit("review evidence role/verdict mismatch")
   report.append({"path":f"docs/deploy-candidates/{slug}","manifest_sha256":mhash,"final_general":{"review_id":fg,"evidence_sha256":fe,"verdict":"PASS"},"final_critical":{"review_id":cg,"evidence_sha256":ce,"verdict":"PASS"}})
  print(json.dumps({"candidate_sha":CANDIDATE,"order":[x[0] for x in PACKAGES],"packages":report},sort_keys=True,separators=(",",":")))
 if __name__=="__main__": main()

@@ -2,6 +2,7 @@
 # shellcheck disable=SC2015,SC2016
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; WF="$ROOT/.github/workflows/manual-db-fulfillment-signer.yml"; V="$ROOT/trusted/manual_db_validate.py"; M="$ROOT/trusted/mint_manual_db_bundle.sh"
+ARCHIVE="$ROOT/trusted/archive_validate.py"; SELECT="$ROOT/trusted/select_staging_artifact.py"
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); echo "PASS $1"; }; bad(){ FAIL=$((FAIL+1)); echo "FAIL $1" >&2; }
 has(){ grep -Fq "$2" "$1"; }
@@ -17,4 +18,33 @@ has "$V" 'pinned package mismatch' && has "$V" 'SQL hash mismatch' && has "$V" '
 has "$WF" 'gh release view' && has "$WF" 'gh release create' && has "$WF" 'concurrency:' && ok J_durable_exactly_once_gate || bad J_durable_exactly_once_gate
 ! rg -n 'psql|supabase db push|apply_migration' "$WF" "$V" "$M" && ok K_no_database_execution || bad K_no_database_execution
 [ "$(sha256sum "$ROOT/trusted/ci-allowed-signers"|awk '{print $1}')" = 704dc47b50f2ebbb8515b400bde88a943d967f313255a85a5bd4b1534177acd9 ] && ok L_existing_ci_trust_compatible || bad L_existing_ci_trust_compatible
+! grep -n "run:.*\${{ inputs\.\|^[[:space:]]*.*'\${{ inputs\." "$WF" >/dev/null && ok M_inputs_not_interpolated_in_shell || bad M_inputs_not_interpolated_in_shell
+has "$WF" 'select_staging_artifact.py' && has "$SELECT" 'run.get("status")!="completed"' && has "$WF" 'manual-db-bundle.tar.gz.sha256' && ok N_crash_safe_recovery || bad N_crash_safe_recovery
+has "$WF" 'verify_release_ref.py' && has "$WF" 'Verify permanent release bytes' && has "$WF" 'repeat mint denied' && ok O_durable_release_verified || bad O_durable_release_verified
+has "$M" 'PROTECTED-REVIEW-EVIDENCE.json' && has "$V" 'protected review evidence hash mismatch' && has "$V" 'review evidence subject mismatch' && ok P_review_artifact_bound || bad P_review_artifact_bound
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+python3 - "$tmp" <<'PY'
+import io,tarfile,zipfile,pathlib,sys
+r=pathlib.Path(sys.argv[1])
+with tarfile.open(r/'bad.tar.gz','w:gz') as t:
+ x=tarfile.TarInfo('../escape'); x.size=1; t.addfile(x,io.BytesIO(b'x'))
+with zipfile.ZipFile(r/'dup.zip','w') as z:
+ z.writestr('a/../x','x'); z.writestr('x','y')
+with tarfile.open(r/'special.tar.gz','w:gz') as t:
+ for name,kind in [('link',tarfile.SYMTYPE),('pipe',tarfile.FIFOTYPE),('device',tarfile.CHRTYPE)]:
+  x=tarfile.TarInfo(name); x.type=kind; x.linkname='target'; t.addfile(x)
+PY
+! "$ARCHIVE" tar "$tmp/bad.tar.gz" >/dev/null 2>&1 && ! "$ARCHIVE" zip "$tmp/dup.zip" >/dev/null 2>&1 && ! "$ARCHIVE" tar "$tmp/special.tar.gz" >/dev/null 2>&1 && ok Q_archive_mutations_rejected || bad Q_archive_mutations_rejected
+cat > "$tmp/artifacts.json" <<JSON
+{"artifacts":[{"id":7,"name":"manual-db-stage-d0819f7bacf5ee6dedca4345796a8d022ff6a5cc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expired":false,"workflow_run":{"id":9,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}
+JSON
+cat > "$tmp/run.json" <<JSON
+{"id":9,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"main","event":"workflow_dispatch","path":".github/workflows/manual-db-fulfillment-signer.yml","status":"in_progress"}
+JSON
+! "$SELECT" "$tmp/artifacts.json" "$tmp/run.json" manual-db-stage-d0819f7bacf5ee6dedca4345796a8d022ff6a5cc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa d0819f7bacf5ee6dedca4345796a8d022ff6a5cc aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null 2>&1 && ok R_incomplete_run_rejected || bad R_incomplete_run_rejected
+mkdir "$tmp/trusted"; cp "$V" "$tmp/trusted/"; cp "$ROOT/trusted/manual-db-review-bindings.json" "$tmp/trusted/"
+sed -i.bak 's/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/' "$tmp/trusted/manual-db-review-bindings.json"
+! "$tmp/trusted/manual_db_validate.py" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc /tmp/icom-db-package >/dev/null 2>&1 && ok S_swapped_review_candidate_rejected || bad S_swapped_review_candidate_rejected
+mkdir "$tmp/empty"; printf 'attacker ssh-ed25519 AAAA\n' > "$tmp/attacker-trust"
+! "$ROOT/trusted/verify_manual_db_bundle.py" "$tmp/empty" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$tmp/attacker-trust" >/dev/null 2>&1 && ok T_external_trust_precedes_bundle_signature || bad T_external_trust_precedes_bundle_signature
 echo "PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ]

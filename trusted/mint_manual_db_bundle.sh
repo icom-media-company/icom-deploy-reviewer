@@ -10,8 +10,10 @@ REPORT="$("$HERE/manual_db_validate.py" "$CANDIDATE" "$ROOT")"
 mkdir -p "$OUT/docs/deploy-candidates" "$OUT/supabase/migrations" "$OUT/scripts" "$OUT/trust"
 printf '%s\n' 20261001-fulfillment-retry-90 20261001-pgsodium-prerequisite-91 20261001-fulfillment-historical-evidence-92 20261001-mto-claim-93 > "$OUT/BUNDLE-ORDER.txt"
 printf '%s\n' "$REPORT" > "$OUT/TRUSTED-REVIEW-BINDINGS.json"
+cp "$HERE/manual-db-review-bindings.json" "$OUT/PROTECTED-REVIEW-EVIDENCE.json"
 cp "$HERE/ci-allowed-signers" "$OUT/trust/"
 cp "$ROOT/scripts/run-fulfillment-recovery-db-package.sh" "$OUT/scripts/"
+cp "$HERE/OWNER-CEREMONY.md" "$OUT/"
 for slug in 20261001-fulfillment-retry-90 20261001-pgsodium-prerequisite-91 20261001-fulfillment-historical-evidence-92 20261001-mto-claim-93; do
  src="$ROOT/docs/deploy-candidates/$slug"; dst="$OUT/docs/deploy-candidates/$slug"; mkdir -p "$dst"
  cp "$src"/{candidate-manifest.json,RUNBOOK.md,PACKAGE.SHA256SUMS,SQL.SHA256SUMS,owner-authorization-request.json} "$dst/"
@@ -30,6 +32,6 @@ raw=json.dumps(items,sort_keys=True,separators=(",",":")).encode(); print(hashli
 PY
 )
 jq -n --arg candidate "$CANDIDATE" --arg control "$CONTROL" --arg inventory "$INV" --argjson count "$COUNT" \
- '{schema_version:1,candidate_sha:$candidate,trusted_control_sha:$control,package_order:["20261001-fulfillment-retry-90","20261001-pgsodium-prerequisite-91","20261001-fulfillment-historical-evidence-92","20261001-mto-claim-93"],authorized_operations:["forward","verify"],payload_inventory_sha256:$inventory,payload_file_count:$count,sql_executed:false}' > "$OUT/BUNDLE-METADATA.json"
+ '{schema_version:1,candidate_sha:$candidate,trusted_control_sha:$control,execution_control_sha:"96722ad7c5c285deb4c636dfff76e6cefa7e5c04",review_evidence_sha256:"8144533067199f1df88b7ec2a7623275d9934feeaebd48f14b4dfa329dc12bc9",package_order:["20261001-fulfillment-retry-90","20261001-pgsodium-prerequisite-91","20261001-fulfillment-historical-evidence-92","20261001-mto-claim-93"],authorized_operations:["forward","verify"],payload_inventory_exclusions:["BUNDLE-METADATA.json","BUNDLE-METADATA.json.ci.sig","BUNDLE.SHA256SUMS"],payload_inventory_sha256:$inventory,payload_file_count:$count,sql_executed:false}' > "$OUT/BUNDLE-METADATA.json"
 ssh-keygen -Y sign -q -f "$KEY" -n icom-db-migration-ci "$OUT/BUNDLE-METADATA.json"; mv "$OUT/BUNDLE-METADATA.json.sig" "$OUT/BUNDLE-METADATA.json.ci.sig"
 (cd "$OUT" && find . -type f ! -name BUNDLE.SHA256SUMS -exec sha256sum {} + | LC_ALL=C sort) > "$OUT/BUNDLE.SHA256SUMS"
