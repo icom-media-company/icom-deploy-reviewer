@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-import hashlib,json,pathlib,re,stat,sys,zipfile
+import hashlib,json,pathlib,re,sys,zipfile
 from datetime import datetime
+from canonical_actions_logs import canonical_digest
 if len(sys.argv)!=13: raise SystemExit("usage: verify_legacy_run_evidence.py attempt1-run attempt1-jobs logs.zip attempt2-run release tag-ref prior1-run prior1-jobs prior2-run prior2-jobs paginated-census authorized-actor")
 runp,jobsp,logzipp,run2p,releasep,refp,prior1p,prior1jobsp,prior2p,prior2jobsp,censusp,authorized=sys.argv[1:]
 def raw(path): return pathlib.Path(path).read_bytes()
 def load(path): return json.loads(raw(path))
 def sha(path): return hashlib.sha256(raw(path)).hexdigest()
-pins={runp:"d5e1d7d2692f23c064e994e8b4d771e09118710366c907025943eb04474a496c",jobsp:"6ee7d03e4c4948474ba8f6727937c1e1f0aacc80a543b2ebe5dcec26dd12d5f2",logzipp:"51c304d815452b48aad45337dcfcd9a60f4542f1100363f181e694370bb54c74",run2p:"2d5a5561f00211af0b73be530d51bb75e6daf9d2868f431b857366dba22a1ca3",prior1p:"6b491e96ac2d129a9ad48d90df36bc33f995e0bf9cbc6a106e9d8d9e062101e5",prior1jobsp:"87a962c3d3642ac7fd252f385ece3fad01862a6bee7df2ae023a3e77d9f71243",prior2p:"84ad3bc2291031006d3c41376e51b8a8b501adade2da8effd3085728f627e6c9",prior2jobsp:"33d193426feadaaf2092e2ca9561a081c542acf2b17f9f85d6ca227996920277"}
+pins={runp:"d5e1d7d2692f23c064e994e8b4d771e09118710366c907025943eb04474a496c",jobsp:"6ee7d03e4c4948474ba8f6727937c1e1f0aacc80a543b2ebe5dcec26dd12d5f2",run2p:"2d5a5561f00211af0b73be530d51bb75e6daf9d2868f431b857366dba22a1ca3",prior1p:"6b491e96ac2d129a9ad48d90df36bc33f995e0bf9cbc6a106e9d8d9e062101e5",prior1jobsp:"87a962c3d3642ac7fd252f385ece3fad01862a6bee7df2ae023a3e77d9f71243",prior2p:"84ad3bc2291031006d3c41376e51b8a8b501adade2da8effd3085728f627e6c9",prior2jobsp:"33d193426feadaaf2092e2ca9561a081c542acf2b17f9f85d6ca227996920277"}
 for path,want in pins.items():
  if sha(path)!=want: raise SystemExit(f"pinned evidence hash mismatch: {path}")
 run=load(runp); jobs=load(jobsp); run2=load(run2p); release=load(releasep); ref=load(refp)
@@ -33,14 +34,11 @@ body=f"candidate={candidate} control={old}; absent staging may resume only with 
 if release.get("id")!=400681564 or release.get("created_at")!="2026-10-01T04:39:32Z" or (release.get("author") or {}).get("login")!="github-actions[bot]" or release.get("draft") is not True or release.get("assets")!=[] or release.get("tag_name")!=tag or release.get("name")!="RESERVED trusted manual DB package" or release.get("body")!=body: raise SystemExit("legacy release evidence mismatch")
 if (ref.get("object") or {}).get("type")!="commit" or (ref.get("object") or {}).get("sha")!=old: raise SystemExit("legacy tag ref mismatch")
 if not (dt(fail["started_at"])<=dt(release["updated_at"])<=dt(fail["completed_at"])): raise SystemExit("release update not within failed step")
-with zipfile.ZipFile(logzipp) as archive:
- names=[]
- for item in archive.infolist():
-  path=pathlib.PurePosixPath(item.filename); mode=item.external_attr>>16
-  if path.is_absolute() or ".." in path.parts or "\\" in item.filename or item.filename in names or stat.S_ISLNK(mode): raise SystemExit("unsafe logs archive")
-  names.append(item.filename)
- if "0_mint.txt" not in names: raise SystemExit("mint log missing")
- text=archive.read("0_mint.txt").decode("utf-8-sig")
+log_names=["0_mint.txt","1_validate-data.txt","mint/system.txt","validate-data/system.txt"]
+try: logs_canonical_sha=canonical_digest(logzipp,log_names)
+except (OSError,ValueError,zipfile.BadZipFile) as error: raise SystemExit(str(error))
+if logs_canonical_sha!="395b7a31117dac39014614c43a92c6ab99f4553cfbd2b361297b2acce10d247a": raise SystemExit("canonical logs digest mismatch")
+with zipfile.ZipFile(logzipp) as archive: text=archive.read("0_mint.txt").decode("utf-8-sig")
 emitted=re.findall(r"https://github\.com/icom-media-company/icom-deploy-reviewer/releases/tag/untagged-[A-Za-z0-9]+",text)
 if '/releases/tags/$tag' not in text or 'gh: Not Found (HTTP 404)' not in text or emitted!=[release.get("html_url")]: raise SystemExit("exact create URL then lookup 404 evidence mismatch")
 if "ssh-keygen" in text or "SIGNING_KEY" in text: raise SystemExit("signing execution found in failed job log")
@@ -65,6 +63,6 @@ for rid,(attempt,conclusion) in expected_listed.items():
  if by_id[rid].get("run_attempt")!=attempt or by_id[rid].get("status")!="completed" or by_id[rid].get("conclusion")!=conclusion: raise SystemExit("legacy census state mismatch")
 census=[{"run_id":rid,"listed_run_attempt":expected_listed[rid][0],"verified_attempts":[1,2] if rid==36821369400 else [1]} for rid in sorted(expected_listed)]
 census_raw=json.dumps(census,sort_keys=True,separators=(",",":")).encode(); census_sha=hashlib.sha256(census_raw).hexdigest()
-selected={"schema_version":1,"repository":"icom-media-company/icom-deploy-reviewer","workflow_id":371811486,"workflow_path":expected_run["path"],"legacy_release_id":400681564,"legacy_release_updated_at":release["updated_at"],"legacy_release_author":"github-actions[bot]","legacy_release_assets_empty_at_supersession":True,"legacy_release_html_url":release["html_url"],"legacy_release_tag":tag,"legacy_tag_target":old,"attempt1_run_id":36821369400,"attempt1_job_id":110237504710,"attempt1_failed_step":"Re-authorize signer and resolve durable state","attempt1_signing_step":"skipped","attempt1_staging_step":"skipped","attempt2_conclusion":"cancelled","post_create_lookup_http_status":404,"earlier_trusted_runs":prior,"legacy_control_workflow_run_census":census,"legacy_control_workflow_run_census_sha256":census_sha,"raw_sha256":{"attempt1_run":pins[runp],"attempt1_jobs":pins[jobsp],"attempt1_logs_zip":pins[logzipp],"attempt2_run":pins[run2p]}}
+selected={"schema_version":1,"repository":"icom-media-company/icom-deploy-reviewer","workflow_id":371811486,"workflow_path":expected_run["path"],"legacy_release_id":400681564,"legacy_release_updated_at":release["updated_at"],"legacy_release_author":"github-actions[bot]","legacy_release_assets_empty_at_supersession":True,"legacy_release_html_url":release["html_url"],"legacy_release_tag":tag,"legacy_tag_target":old,"attempt1_run_id":36821369400,"attempt1_job_id":110237504710,"attempt1_failed_step":"Re-authorize signer and resolve durable state","attempt1_signing_step":"skipped","attempt1_staging_step":"skipped","attempt2_conclusion":"cancelled","post_create_lookup_http_status":404,"earlier_trusted_runs":prior,"legacy_control_workflow_run_census":census,"legacy_control_workflow_run_census_sha256":census_sha,"raw_sha256":{"attempt1_run":pins[runp],"attempt1_jobs":pins[jobsp],"attempt2_run":pins[run2p]},"canonical_content_sha256":{"attempt1_logs":logs_canonical_sha}}
 encoded=json.dumps(selected,sort_keys=True,separators=(",",":"))
 print(encoded)

@@ -103,7 +103,7 @@ jobs:
             "$RUNNER_TEMP/legacy-prior2-run.json" "$RUNNER_TEMP/legacy-prior2-jobs.json" \
             "$RUNNER_TEMP/legacy-control-run-census.json" \
             "$AUTHORIZED_ACTOR" > "$RUNNER_TEMP/legacy-run-evidence.json"
-          [ "$(sha256sum "$RUNNER_TEMP/legacy-run-evidence.json" | awk '{print $1}')" = dcab48eb99df5fe1b7ab8888b9e00e8a69d6cbb81d6bcf21359a37003400acf9 ]
+          [ "$(sha256sum "$RUNNER_TEMP/legacy-run-evidence.json" | awk '{print $1}')" = 3549e491b6ae684b4d4cfec450bcb47ad373e514c95c6ea07f3be840c62acd24 ]
           tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
           artifact="manual-db-stage-$INPUT_CANDIDATE_SHA-$INPUT_CONTROL_SHA"
           tag_exists=false; release_exists=false; reservation_valid=false; created_reservation=false
