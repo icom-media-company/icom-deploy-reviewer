@@ -64,19 +64,34 @@ cp -R "$ROOT/trusted" "$tmp/repro-control"
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$tmp/repro-key"
 pub="$(ssh-keygen -y -f "$tmp/repro-key" | awk '{print $1" "$2}')"
 printf 'icom-deploy-ci %s\n' "$pub" > "$tmp/repro-control/ci-allowed-signers"
-"$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-one" >/dev/null
-"$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-two" >/dev/null
+cat > "$tmp/legacy-run-evidence.json" <<'JSON'
+{"attempt1_failed_step":"Re-authorize signer and resolve durable state","attempt1_job_id":110237504710,"attempt1_run_id":36821369400,"attempt1_signing_step":"skipped","attempt1_staging_step":"skipped","attempt2_conclusion":"cancelled","legacy_release_assets_empty_at_supersession":true,"legacy_release_author":"github-actions[bot]","legacy_release_created_at_commit_timestamp":"2026-10-01T04:39:32Z","legacy_release_id":400681564,"legacy_release_updated_at":"2026-10-01T05:47:07Z","no_trusted_signing_workflow_run_before_release_creation":true,"post_create_lookup_http_status":404,"raw_sha256":{"attempt1_jobs":"6ee7d03e4c4948474ba8f6727937c1e1f0aacc80a543b2ebe5dcec26dd12d5f2","attempt1_logs_zip":"51c304d815452b48aad45337dcfcd9a60f4542f1100363f181e694370bb54c74","attempt1_run":"d5e1d7d2692f23c064e994e8b4d771e09118710366c907025943eb04474a496c","attempt2_run":"2d5a5561f00211af0b73be530d51bb75e6daf9d2868f431b857366dba22a1ca3"},"repository":"icom-media-company/icom-deploy-reviewer","schema_version":1,"workflow_id":371811486,"workflow_path":".github/workflows/manual-db-fulfillment-signer.yml"}
+JSON
+"$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-one" "$tmp/legacy-run-evidence.json" >/dev/null
+"$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/build-two" "$tmp/legacy-run-evidence.json" >/dev/null
 "$ROOT/trusted/create_reproducible_tar.py" "$tmp/build-one" "$tmp/one.tar.gz"
 "$ROOT/trusted/create_reproducible_tar.py" "$tmp/build-two" "$tmp/two.tar.gz"
 diff -qr "$tmp/build-one" "$tmp/build-two" >/dev/null && cmp "$tmp/one.tar.gz" "$tmp/two.tar.gz" >/dev/null \
  && test -f "$tmp/build-one/LEGACY-RESERVATION-SUPERSESSION.json.ci.sig" \
- && jq -e '.legacy_release_id==400681564 and .observed_empty==true and .prior_signing==false and .superseded_by_control=="1111111111111111111111111111111111111111"' "$tmp/build-one/LEGACY-RESERVATION-SUPERSESSION.json" >/dev/null \
+ && jq -e '.legacy_release_id==400681564 and .prior_durable_release_assets_empty_at_supersession==true and .trusted_mint_attempt1_signing_step=="skipped" and (has("prior_signing")|not) and .superseded_by_control=="1111111111111111111111111111111111111111"' "$tmp/build-one/LEGACY-RESERVATION-SUPERSESSION.json" >/dev/null \
  && ok W_ed25519_signatures_and_archive_reproducible || bad W_ed25519_signatures_and_archive_reproducible
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$tmp/wrong-key"
 ssh-keygen -q -t rsa -b 2048 -N '' -C '' -f "$tmp/rsa-key"
-! "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/wrong-key" "$tmp/wrong-build" >/dev/null 2>&1 \
- && ! "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/rsa-key" "$tmp/rsa-build" >/dev/null 2>&1 \
+! "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/wrong-key" "$tmp/wrong-build" "$tmp/legacy-run-evidence.json" >/dev/null 2>&1 \
+ && ! "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/rsa-key" "$tmp/rsa-build" "$tmp/legacy-run-evidence.json" >/dev/null 2>&1 \
  && ok X_wrong_and_non_ed25519_keys_rejected || bad X_wrong_and_non_ed25519_keys_rejected
+legacy_mutations_pass=true
+for spec in \
+  '.attempt1_run_id=1' \
+  '.attempt1_job_id=1' \
+  '.attempt1_signing_step="success"' \
+  '.raw_sha256.attempt1_logs_zip="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.legacy_release_updated_at="2026-10-01T00:00:00Z"'; do
+  index="$(printf '%s' "$spec" | shasum -a 256 | cut -c1-8)"
+  jq -c "$spec" "$tmp/legacy-run-evidence.json" > "$tmp/legacy-mutated-$index.json"
+  if "$tmp/repro-control/mint_manual_db_bundle.sh" /tmp/icom-db-package d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 "$tmp/repro-key" "$tmp/mutated-build-$index" "$tmp/legacy-mutated-$index.json" >/dev/null 2>&1; then legacy_mutations_pass=false; fi
+done
+[ "$legacy_mutations_pass" = true ] && ok X2_run_job_step_log_timestamp_mutations_rejected || bad X2_run_job_step_log_timestamp_mutations_rejected
 cat > "$tmp/reservation.json" <<'JSON'
 {"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; supersedes_legacy_release=400681564 old_control=b589d4d92200ac393a04344f2f203efe7f177e6a reason=pre-sign draft-discovery 404"}
 JSON

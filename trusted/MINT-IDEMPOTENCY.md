@@ -31,3 +31,12 @@ then leaves them untouched. It creates a distinct reservation under the new revi
 identity. The signed bundle contains `LEGACY-RESERVATION-SUPERSESSION.json`, binding the old
 ID/tag/control and the new control. This is governed supersession, not recovery or deletion
 of the legacy reservation.
+
+Before supersession, the workflow downloads and pins attempt-1 run JSON, jobs JSON and logs
+ZIP for run `36821369400`, plus the cancelled attempt 2 and complete workflow history. It
+proves mint job `110237504710` failed during reservation discovery, while signing and staging
+steps were skipped. GitHub Release `created_at` is the release commit timestamp; the proof
+uses `updated_at` inside the failed step window, the bot author, emitted untagged release URL,
+subsequent HTTP 404, and empty durable assets. The claim is deliberately narrow: it does not
+assert absolute historical `prior_signing=false`. Raw logs are not bundled; their immutable
+SHA-256 is recorded in signed `LEGACY-RUN-EVIDENCE.json` to avoid propagating operational logs.

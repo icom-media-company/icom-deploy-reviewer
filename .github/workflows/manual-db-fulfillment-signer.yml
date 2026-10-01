@@ -86,6 +86,17 @@ jobs:
           trusted/verify_legacy_reservation.py "$RUNNER_TEMP/legacy-reservation.json"
           gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$old_tag" > "$RUNNER_TEMP/legacy-tag.json"
           trusted/verify_release_ref.py "$RUNNER_TEMP/legacy-tag.json" "$old_control"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36821369400/attempts/1" > "$RUNNER_TEMP/legacy-attempt1-run.json"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36821369400/attempts/1/jobs?per_page=100" > "$RUNNER_TEMP/legacy-attempt1-jobs.json"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36821369400/attempts/1/logs" > "$RUNNER_TEMP/legacy-attempt1-logs.zip"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/36821369400/attempts/2" > "$RUNNER_TEMP/legacy-attempt2-run.json"
+          gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/actions/workflows/371811486/runs?per_page=100" > "$RUNNER_TEMP/legacy-workflow-history.json"
+          trusted/verify_legacy_run_evidence.py \
+            "$RUNNER_TEMP/legacy-attempt1-run.json" "$RUNNER_TEMP/legacy-attempt1-jobs.json" \
+            "$RUNNER_TEMP/legacy-attempt1-logs.zip" "$RUNNER_TEMP/legacy-attempt2-run.json" \
+            "$RUNNER_TEMP/legacy-reservation.json" "$RUNNER_TEMP/legacy-workflow-history.json" \
+            "$AUTHORIZED_ACTOR" > "$RUNNER_TEMP/legacy-run-evidence.json"
+          [ "$(sha256sum "$RUNNER_TEMP/legacy-run-evidence.json" | awk '{print $1}')" = 57b418667e80adf9ef0932308af202d3448342ceae342454f7417cb438ddce47 ]
           tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
           artifact="manual-db-stage-$INPUT_CANDIDATE_SHA-$INPUT_CONTROL_SHA"
           tag_exists=false; release_exists=false; reservation_valid=false; created_reservation=false
@@ -188,7 +199,7 @@ jobs:
           trusted/archive_validate.py tar "$RUNNER_TEMP/handoff/validated-candidate.tar.gz"
           mkdir "$RUNNER_TEMP/candidate"; tar -xzf "$RUNNER_TEMP/handoff/validated-candidate.tar.gz" -C "$RUNNER_TEMP/candidate"
           trusted/manual_db_validate.py "$INPUT_CANDIDATE_SHA" "$RUNNER_TEMP/candidate" >/dev/null
-          trusted/mint_manual_db_bundle.sh "$RUNNER_TEMP/candidate" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" "$key" "$RUNNER_TEMP/bundle"
+          trusted/mint_manual_db_bundle.sh "$RUNNER_TEMP/candidate" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" "$key" "$RUNNER_TEMP/bundle" "$RUNNER_TEMP/legacy-run-evidence.json"
           trusted/create_reproducible_tar.py "$RUNNER_TEMP/bundle" "$RUNNER_TEMP/manual-db-bundle.tar.gz"
           (cd "$RUNNER_TEMP" && sha256sum manual-db-bundle.tar.gz > manual-db-bundle.tar.gz.sha256)
           mkdir "$RUNNER_TEMP/bundle-check"
