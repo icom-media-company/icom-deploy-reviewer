@@ -57,7 +57,7 @@ JSON
 cat > "$tmp/release-extra.json" <<'JSON'
 {"draft":false,"assets":[{"name":"manual-db-bundle.tar.gz.sha256"},{"name":"manual-db-bundle.tar.gz"},{"name":"evil"}]}
 JSON
-"$ASSETS" "$tmp/release-good.json" && ! "$ASSETS" "$tmp/release-extra.json" >/dev/null 2>&1 && ok V_release_asset_exact_census || bad V_release_asset_exact_census
+"$ASSETS" "$tmp/release-good.json" published && ! "$ASSETS" "$tmp/release-extra.json" published >/dev/null 2>&1 && ok V_release_asset_exact_census || bad V_release_asset_exact_census
 cp -R "$ROOT/trusted" "$tmp/repro-control"
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$tmp/repro-key"
 pub="$(ssh-keygen -y -f "$tmp/repro-key" | awk '{print $1" "$2}')"
@@ -78,4 +78,18 @@ JSON
 "$RESERVATION" "$tmp/reservation.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111
 sed 's/byte-identical/different/' "$tmp/reservation.json" > "$tmp/reservation-bad.json"
 ! "$RESERVATION" "$tmp/reservation-bad.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 >/dev/null 2>&1 && ok Y_exact_reservation_identity || bad Y_exact_reservation_identity
+cat > "$tmp/draft-empty.json" <<'JSON'
+{"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; absent staging may resume only with byte-identical deterministic mint","assets":[]}
+JSON
+cat > "$tmp/draft-exact.json" <<'JSON'
+{"draft":true,"tag_name":"manual-db/fulfillment/d0819f7bacf5ee6dedca4345796a8d022ff6a5cc/1111111111111111111111111111111111111111","name":"RESERVED trusted manual DB package","body":"candidate=d0819f7bacf5ee6dedca4345796a8d022ff6a5cc control=1111111111111111111111111111111111111111; absent staging may resume only with byte-identical deterministic mint","assets":[{"name":"manual-db-bundle.tar.gz.sha256"},{"name":"manual-db-bundle.tar.gz"}]}
+JSON
+"$RESERVATION" "$tmp/draft-empty.json" d0819f7bacf5ee6dedca4345796a8d022ff6a5cc 1111111111111111111111111111111111111111 \
+ && [ "$("$DECIDE" false true true absent)" = resume_idempotent ] \
+ && "$ASSETS" "$tmp/draft-exact.json" draft \
+ && ! "$ASSETS" "$tmp/release-extra.json" draft >/dev/null 2>&1 \
+ && has "$WF" 'if [ "$release_exists" = false ]; then' \
+ && has "$WF" 'state=release_staged' \
+ && has "$WF" 'Verify draft assets before publication' \
+ && ok Z_partial_state_matrix || bad Z_partial_state_matrix
 echo "PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ]
