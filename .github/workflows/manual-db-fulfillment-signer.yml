@@ -1,0 +1,217 @@
+name: Trusted manual DB fulfillment signer
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha: {description: Exact business candidate SHA, required: true, type: string}
+      expected_control_sha: {description: Exact reviewed signer control SHA, required: true, type: string}
+      validation_only: {description: Validate only without signing or mint, required: true, default: true, type: boolean}
+permissions: {}
+concurrency:
+  group: trusted-manual-db-${{ inputs.candidate_sha }}-${{ inputs.expected_control_sha }}
+  cancel-in-progress: false
+jobs:
+  validate-data:
+    environment: read-business
+    permissions: {contents: read}
+    runs-on: ubuntu-latest
+    env:
+      AUTHORIZED_ACTOR: ${{ vars.ICOM_MANUAL_DB_AUTHORIZED_ACTOR }}
+      INPUT_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      INPUT_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0}
+      - name: Authorize protected reviewer control plane
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = icom-media-company/icom-deploy-reviewer ]
+          [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$GITHUB_WORKFLOW_REF" = 'icom-media-company/icom-deploy-reviewer/.github/workflows/manual-db-fulfillment-signer.yml@refs/heads/main' ]
+          [ -n "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_ACTOR" = "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_TRIGGERING_ACTOR" = "$AUTHORIZED_ACTOR" ]
+          [[ "$INPUT_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$INPUT_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$GITHUB_SHA" = "$INPUT_CONTROL_SHA" ]
+          [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ] && [ -z "$(git status --porcelain)" ]
+          [ "$INPUT_CANDIDATE_SHA" = d0819f7bacf5ee6dedca4345796a8d022ff6a5cc ]
+      - name: Fetch exact business candidate as data only
+        env:
+          BUSINESS_TOKEN: ${{ secrets.ICOM_BUSINESS_READ_TOKEN }}
+        run: |
+          set -euo pipefail; [ -n "$BUSINESS_TOKEN" ]
+          api=https://api.github.com/repos/icom-media/icom-business
+          actual="$(curl -fsSL -H "Authorization: Bearer $BUSINESS_TOKEN" -H 'Accept: application/vnd.github+json' "$api/commits/$INPUT_CANDIDATE_SHA" | jq -r .sha)"
+          [ "$actual" = "$INPUT_CANDIDATE_SHA" ]
+          curl -fsSL -H "Authorization: Bearer $BUSINESS_TOKEN" -H 'Accept: application/vnd.github+json' "$api/tarball/$actual" -o "$RUNNER_TEMP/candidate.tar.gz"
+          trusted/archive_validate.py tar "$RUNNER_TEMP/candidate.tar.gz"
+          mkdir "$RUNNER_TEMP/candidate"; tar -xzf "$RUNNER_TEMP/candidate.tar.gz" -C "$RUNNER_TEMP/candidate" --strip-components=1
+          trusted/manual_db_validate.py "$actual" "$RUNNER_TEMP/candidate" > "$RUNNER_TEMP/validation.json"
+          tar -czf "$RUNNER_TEMP/validated-candidate.tar.gz" -C "$RUNNER_TEMP/candidate" .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: inputs.validation_only == false
+        with:
+          name: validated-manual-db-${{ inputs.candidate_sha }}-${{ inputs.expected_control_sha }}
+          path: |
+            ${{ runner.temp }}/validated-candidate.tar.gz
+            ${{ runner.temp }}/validation.json
+          if-no-files-found: error
+          retention-days: 1
+  mint:
+    if: inputs.validation_only == false
+    needs: validate-data
+    environment: manual-db-sign
+    permissions: {actions: read, contents: write}
+    runs-on: ubuntu-latest
+    env:
+      AUTHORIZED_ACTOR: ${{ vars.ICOM_MANUAL_DB_AUTHORIZED_ACTOR }}
+      INPUT_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      INPUT_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0}
+      - name: Re-authorize signer and resolve durable state
+        id: state
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = icom-media-company/icom-deploy-reviewer ] && [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$GITHUB_WORKFLOW_REF" = 'icom-media-company/icom-deploy-reviewer/.github/workflows/manual-db-fulfillment-signer.yml@refs/heads/main' ]
+          [[ "$INPUT_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$INPUT_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$GITHUB_SHA" = "$INPUT_CONTROL_SHA" ]
+          [ "$(git rev-parse HEAD)" = "$INPUT_CONTROL_SHA" ] && [ -z "$(git status --porcelain)" ]
+          [ -n "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_ACTOR" = "$AUTHORIZED_ACTOR" ] && [ "$GITHUB_TRIGGERING_ACTOR" = "$AUTHORIZED_ACTOR" ]
+          tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
+          artifact="manual-db-stage-$INPUT_CANDIDATE_SHA-$INPUT_CONTROL_SHA"
+          tag_exists=false; release_exists=false; reservation_valid=false; created_reservation=false
+          if gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/tag.json" 2>/dev/null; then
+            tag_exists=true; trusted/verify_release_ref.py "$RUNNER_TEMP/tag.json" "$INPUT_CONTROL_SHA"
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=true; mkdir -p "$RUNNER_TEMP/completed" "$RUNNER_TEMP/completed-root"
+            gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/completed-release.json"
+            if [ "$(jq -r .draft "$RUNNER_TEMP/completed-release.json")" = false ]; then
+              trusted/verify_release_assets.py "$RUNNER_TEMP/completed-release.json" published
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/completed" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256
+              (cd "$RUNNER_TEMP/completed" && sha256sum -c manual-db-bundle.tar.gz.sha256)
+              trusted/archive_validate.py tar "$RUNNER_TEMP/completed/manual-db-bundle.tar.gz"
+              tar -xzf "$RUNNER_TEMP/completed/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/completed-root"
+              trusted/verify_manual_db_bundle.py "$RUNNER_TEMP/completed-root" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" trusted/ci-allowed-signers
+              echo 'FAIL: durable verified release already exists; repeat mint denied' >&2; exit 1
+            fi
+            trusted/verify_reservation.py "$RUNNER_TEMP/completed-release.json" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA"
+            reservation_valid=true
+            asset_count="$(jq '.assets|length' "$RUNNER_TEMP/completed-release.json")"
+            if [ "$asset_count" = 2 ]; then
+              trusted/verify_release_assets.py "$RUNNER_TEMP/completed-release.json" draft
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/completed" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256
+              (cd "$RUNNER_TEMP/completed" && sha256sum -c manual-db-bundle.tar.gz.sha256)
+              trusted/archive_validate.py tar "$RUNNER_TEMP/completed/manual-db-bundle.tar.gz"
+              tar -xzf "$RUNNER_TEMP/completed/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/completed-root"
+              trusted/verify_manual_db_bundle.py "$RUNNER_TEMP/completed-root" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" trusted/ci-allowed-signers
+              echo 'state=release_staged' >> "$GITHUB_OUTPUT"; echo 'release_exists=true' >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            [ "$asset_count" = 0 ] || { echo 'FAIL: draft reservation has partial/extra assets' >&2; exit 1; }
+          fi
+          if [ "$release_exists" = false ]; then
+            if [ "$tag_exists" = false ]; then
+              gh api --method POST "/repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$INPUT_CONTROL_SHA" >/dev/null
+              tag_exists=true; created_reservation=true
+            fi
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "RESERVED trusted manual DB package" --notes "candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA; absent staging may resume only with byte-identical deterministic mint"
+            gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/reserved-tag.json"
+            trusted/verify_release_ref.py "$RUNNER_TEMP/reserved-tag.json" "$INPUT_CONTROL_SHA"
+            gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/reserved-release.json"
+            trusted/verify_reservation.py "$RUNNER_TEMP/reserved-release.json" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA"
+            release_exists=true; reservation_valid=true
+          fi
+          echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
+          gh api --method GET "/repos/$GITHUB_REPOSITORY/actions/artifacts" -f name="$artifact" > "$RUNNER_TEMP/artifacts.json"
+          count="$(jq '[.artifacts[]|select(.name==$n and .expired==false)]|length' --arg n "$artifact" "$RUNNER_TEMP/artifacts.json")"
+          if [ "$count" = 0 ]; then
+            state="$(trusted/decide_mint_state.py "$created_reservation" "$tag_exists" "$reservation_valid" absent)"
+            echo "state=$state" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          [ "$count" = 1 ] || { echo 'ambiguous staging artifacts' >&2; exit 1; }
+          run_id="$(jq -r --arg n "$artifact" '.artifacts[]|select(.name==$n and .expired==false)|.workflow_run.id' "$RUNNER_TEMP/artifacts.json")"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/run.json"
+          id="$(trusted/select_staging_artifact.py "$RUNNER_TEMP/artifacts.json" "$RUNNER_TEMP/run.json" "$artifact" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA")"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/staging.zip"
+          trusted/archive_validate.py zip "$RUNNER_TEMP/staging.zip"
+          mkdir -p "$RUNNER_TEMP/recovery" "$RUNNER_TEMP/recovery-root"; unzip -q "$RUNNER_TEMP/staging.zip" -d "$RUNNER_TEMP/recovery"
+          (cd "$RUNNER_TEMP/recovery" && sha256sum -c manual-db-bundle.tar.gz.sha256)
+          trusted/archive_validate.py tar "$RUNNER_TEMP/recovery/manual-db-bundle.tar.gz"
+          tar -xzf "$RUNNER_TEMP/recovery/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/recovery-root"
+          trusted/verify_manual_db_bundle.py "$RUNNER_TEMP/recovery-root" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" trusted/ci-allowed-signers
+          state="$(trusted/decide_mint_state.py false "$tag_exists" "$reservation_valid" verified)"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: steps.state.outputs.state == 'new' || steps.state.outputs.state == 'resume_idempotent'
+        with:
+          name: validated-manual-db-${{ inputs.candidate_sha }}-${{ inputs.expected_control_sha }}
+          path: ${{ runner.temp }}/handoff
+      - name: Revalidate data and sign exact manifests
+        if: steps.state.outputs.state == 'new' || steps.state.outputs.state == 'resume_idempotent'
+        env:
+          SIGNING_KEY: ${{ secrets.ICOM_DEPLOY_CI_SIGNING_KEY }}
+        run: |
+          set -euo pipefail; [ -n "$SIGNING_KEY" ]; umask 077
+          key="$RUNNER_TEMP/ci-key"; cleanup(){ shred -u "$key" 2>/dev/null || rm -f "$key"; }; trap cleanup EXIT
+          printf '%s\n' "$SIGNING_KEY" > "$key"; chmod 600 "$key"
+          trusted/archive_validate.py tar "$RUNNER_TEMP/handoff/validated-candidate.tar.gz"
+          mkdir "$RUNNER_TEMP/candidate"; tar -xzf "$RUNNER_TEMP/handoff/validated-candidate.tar.gz" -C "$RUNNER_TEMP/candidate"
+          trusted/manual_db_validate.py "$INPUT_CANDIDATE_SHA" "$RUNNER_TEMP/candidate" >/dev/null
+          trusted/mint_manual_db_bundle.sh "$RUNNER_TEMP/candidate" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" "$key" "$RUNNER_TEMP/bundle"
+          trusted/create_reproducible_tar.py "$RUNNER_TEMP/bundle" "$RUNNER_TEMP/manual-db-bundle.tar.gz"
+          (cd "$RUNNER_TEMP" && sha256sum manual-db-bundle.tar.gz > manual-db-bundle.tar.gz.sha256)
+          mkdir "$RUNNER_TEMP/bundle-check"
+          tar -xzf "$RUNNER_TEMP/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/bundle-check"
+          trusted/verify_manual_db_bundle.py "$RUNNER_TEMP/bundle-check" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" trusted/ci-allowed-signers
+      - name: Upload crash-recovery staging bytes
+        if: steps.state.outputs.state == 'new' || steps.state.outputs.state == 'resume_idempotent'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: manual-db-stage-${{ inputs.candidate_sha }}-${{ inputs.expected_control_sha }}
+          path: |
+            ${{ runner.temp }}/manual-db-bundle.tar.gz
+            ${{ runner.temp }}/manual-db-bundle.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Stage exact release assets
+        if: steps.state.outputs.state != 'release_staged'
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          set -euo pipefail
+          tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
+          if [ '${{ steps.state.outputs.state }}' = recover ]; then source="$RUNNER_TEMP/recovery"; else source="$RUNNER_TEMP"; fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$source/manual-db-bundle.tar.gz" "$source/manual-db-bundle.tar.gz.sha256"
+      - name: Verify draft assets before publication
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          set -euo pipefail; tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
+          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/prepublish-release.json"
+          trusted/verify_reservation.py "$RUNNER_TEMP/prepublish-release.json" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA"
+          trusted/verify_release_assets.py "$RUNNER_TEMP/prepublish-release.json" draft
+          mkdir -p "$RUNNER_TEMP/prepublish" "$RUNNER_TEMP/prepublish-root"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/prepublish" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256
+          (cd "$RUNNER_TEMP/prepublish" && sha256sum -c manual-db-bundle.tar.gz.sha256)
+          trusted/archive_validate.py tar "$RUNNER_TEMP/prepublish/manual-db-bundle.tar.gz"
+          tar -xzf "$RUNNER_TEMP/prepublish/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/prepublish-root"
+          trusted/verify_manual_db_bundle.py "$RUNNER_TEMP/prepublish-root" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" trusted/ci-allowed-signers
+      - name: Publish verified durable release
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          set -euo pipefail; tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --title "Trusted manual DB fulfillment package" --notes "candidate=$INPUT_CANDIDATE_SHA control=$INPUT_CONTROL_SHA order=90,91,92,93"
+      - name: Verify permanent release bytes
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          set -euo pipefail; tag="manual-db/fulfillment/$INPUT_CANDIDATE_SHA/$INPUT_CONTROL_SHA"
+          gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/final-tag.json"
+          trusted/verify_release_ref.py "$RUNNER_TEMP/final-tag.json" "$INPUT_CONTROL_SHA"
+          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/final-release.json"
+          trusted/verify_release_assets.py "$RUNNER_TEMP/final-release.json" published
+          mkdir -p "$RUNNER_TEMP/final" "$RUNNER_TEMP/final-root"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/final" --pattern manual-db-bundle.tar.gz --pattern manual-db-bundle.tar.gz.sha256
+          (cd "$RUNNER_TEMP/final" && sha256sum -c manual-db-bundle.tar.gz.sha256)
+          trusted/archive_validate.py tar "$RUNNER_TEMP/final/manual-db-bundle.tar.gz"
+          tar -xzf "$RUNNER_TEMP/final/manual-db-bundle.tar.gz" -C "$RUNNER_TEMP/final-root"
+          trusted/verify_manual_db_bundle.py "$RUNNER_TEMP/final-root" "$INPUT_CANDIDATE_SHA" "$INPUT_CONTROL_SHA" trusted/ci-allowed-signers
